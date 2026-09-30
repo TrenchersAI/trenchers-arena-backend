@@ -2,6 +2,7 @@
 //! platform API and the indexer API.
 
 pub mod config;
+pub mod routes;
 
 use axum::routing::get;
 use axum::{Json, Router};

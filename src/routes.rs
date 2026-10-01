@@ -1,9 +1,14 @@
-//! Route allowlist: every route the gateway forwards, and the upstream and
-//! path each one goes to.
+//! Route allowlist. A request that doesn't match an entry in [`ROUTES`] gets a
+//! 404 and never reaches an upstream.
 
 use std::fmt;
 
-use axum::http::Method;
+use axum::http::{Method, Uri};
+use axum::routing::get;
+use axum::{Json, Router};
+use serde_json::{json, Value};
+
+use crate::error::GatewayError;
 use Verb::{Get, Post, Put};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -150,11 +155,34 @@ pub static ROUTES: &[Route] = &[
     },
 ];
 
+/// Builds the router: `GET /health`, and a JSON 404 for everything else,
+/// including a known path with the wrong method.
+pub fn router() -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .fallback(not_found)
+        // Only applies to routes added before this call.
+        .method_not_allowed_fallback(not_found)
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+async fn not_found(method: Method, uri: Uri) -> GatewayError {
+    tracing::debug!(%method, "no route");
+    GatewayError::RouteNotFound {
+        method,
+        path: uri.path().to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::validate;
 
     #[test]
     fn should_list_each_method_and_path_once() {
@@ -166,6 +194,21 @@ mod tests {
                 route.verb.method(),
                 route.path
             );
+        }
+    }
+
+    #[test]
+    fn should_check_every_path_parameter() {
+        for route in ROUTES {
+            for segment in route.path.split('/').chain(route.upstream_path.split('/')) {
+                if let Some(name) = param_name(segment) {
+                    assert!(
+                        validate::is_known(name),
+                        "{}: `{{{name}}}` has no check in validate::path_param",
+                        route.path
+                    );
+                }
+            }
         }
     }
 
@@ -228,7 +271,6 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::on;
         use axum::routing::MethodFilter;
-        use axum::Router;
         use tower::ServiceExt;
 
         use super::super::*;

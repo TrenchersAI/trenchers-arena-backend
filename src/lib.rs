@@ -2,19 +2,13 @@
 //! platform API and the indexer API.
 
 pub mod config;
+pub mod error;
 pub mod routes;
-
-use axum::routing::get;
-use axum::{Json, Router};
-use serde_json::{json, Value};
+pub mod validate;
 
 pub use config::Config;
 
 /// Builds the gateway's axum router.
-pub fn app(_config: &Config) -> Router {
-    Router::new().route("/health", get(health))
-}
-
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+pub fn app(_config: &Config) -> axum::Router {
+    routes::router()
 }

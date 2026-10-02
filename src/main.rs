@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env().context("invalid configuration")?;
-    let app = app(&config);
+    let app = app(&config).context("could not build the upstream HTTP client")?;
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = TcpListener::bind(addr)
         .await

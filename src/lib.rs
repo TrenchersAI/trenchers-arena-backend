@@ -1,14 +1,15 @@
-//! Backend for the Arena mobile app: an HTTP gateway in front of the
-//! platform API and the indexer API.
+//! Backend for the Arena mobile app: an HTTP gateway that forwards
+//! the routes in [`routes::ROUTES`] to the platform API and the indexer API.
 
 pub mod config;
 pub mod error;
+pub mod proxy;
 pub mod routes;
 pub mod validate;
 
 pub use config::Config;
 
 /// Builds the gateway's axum router.
-pub fn app(_config: &Config) -> axum::Router {
-    routes::router()
+pub fn app(config: &Config) -> Result<axum::Router, reqwest::Error> {
+    Ok(routes::router(proxy::Proxy::new(config)?))
 }

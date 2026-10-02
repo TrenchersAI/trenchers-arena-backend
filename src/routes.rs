@@ -3,12 +3,14 @@
 
 use std::fmt;
 
+use axum::extract::{Request, State};
 use axum::http::{Method, Uri};
-use axum::routing::get;
+use axum::routing::{get, post, put, MethodRouter};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::error::GatewayError;
+use crate::proxy::Proxy;
 use Verb::{Get, Post, Put};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -155,14 +157,37 @@ pub static ROUTES: &[Route] = &[
     },
 ];
 
-/// Builds the router: `GET /health`, and a JSON 404 for everything else,
-/// including a known path with the wrong method.
-pub fn router() -> Router {
+/// Builds the router: the allowed routes, `GET /health`, and a JSON 404 for
+/// everything else, including a known path with the wrong method.
+pub fn router(proxy: Proxy) -> Router {
     Router::new()
+        .merge(group(Upstream::Platform))
+        .merge(group(Upstream::Indexer))
         .route("/health", get(health))
         .fallback(not_found)
         // Only applies to routes added before this call.
         .method_not_allowed_fallback(not_found)
+        .with_state(proxy)
+}
+
+fn group(upstream: Upstream) -> Router<Proxy> {
+    ROUTES
+        .iter()
+        .filter(|route| route.upstream == upstream)
+        .fold(Router::new(), |router, route| {
+            router.route(route.path, forwarding(route))
+        })
+}
+
+fn forwarding(route: &'static Route) -> MethodRouter<Proxy> {
+    let handler = move |State(proxy): State<Proxy>, request: Request| async move {
+        proxy.forward(route, request).await
+    };
+    match route.verb {
+        Get => get(handler),
+        Post => post(handler),
+        Put => put(handler),
+    }
 }
 
 async fn health() -> Json<Value> {

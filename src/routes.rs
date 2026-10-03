@@ -8,10 +8,18 @@ use axum::http::{Method, Uri};
 use axum::routing::{get, post, put, MethodRouter};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::error::GatewayError;
 use crate::proxy::Proxy;
 use Verb::{Get, Post, Put};
+
+/// Max in-flight requests to the platform API. Requests over the limit wait.
+const PLATFORM_CONCURRENCY: usize = 64;
+
+/// Max in-flight chart requests, kept separate so chart traffic can't delay
+/// sign-ins or bot actions.
+const INDEXER_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Upstream {
@@ -161,8 +169,9 @@ pub static ROUTES: &[Route] = &[
 /// everything else, including a known path with the wrong method.
 pub fn router(proxy: Proxy) -> Router {
     Router::new()
-        .merge(group(Upstream::Platform))
-        .merge(group(Upstream::Indexer))
+        .merge(limited(group(Upstream::Platform), PLATFORM_CONCURRENCY))
+        .merge(limited(group(Upstream::Indexer), INDEXER_CONCURRENCY))
+        // Outside the limits, so health checks never wait behind upstream calls.
         .route("/health", get(health))
         .fallback(not_found)
         // Only applies to routes added before this call.
@@ -177,6 +186,15 @@ fn group(upstream: Upstream) -> Router<Proxy> {
         .fold(Router::new(), |router, route| {
             router.route(route.path, forwarding(route))
         })
+}
+
+/// One concurrency limit for the whole group. `ConcurrencyLimitLayer` would
+/// create a semaphore per route, because axum layers each route separately.
+fn limited<S>(group: Router<S>, max: usize) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    group.layer(GlobalConcurrencyLimitLayer::new(max))
 }
 
 fn forwarding(route: &'static Route) -> MethodRouter<Proxy> {
@@ -208,6 +226,52 @@ mod tests {
 
     use super::*;
     use crate::validate;
+
+    /// While one route holds the group's only permit, other routes in the
+    /// group have to wait for it.
+    #[tokio::test]
+    async fn should_share_one_limit_across_every_route_in_a_group() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use axum::body::Body;
+        use axum::http::Request;
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let slow = {
+            let (entered, release) = (entered.clone(), release.clone());
+            move || async move {
+                entered.notify_one();
+                release.notified().await;
+                "slow"
+            }
+        };
+        let group = Router::new()
+            .route("/slow", get(slow))
+            .route("/fast", get(|| async { "fast" }));
+        let router = limited(group, 1);
+        let request = |uri: &str| Request::get(uri).body(Body::empty()).expect("request");
+
+        let holder = tokio::spawn(router.clone().oneshot(request("/slow")));
+        entered.notified().await;
+        let fast = router.clone().oneshot(request("/fast"));
+        tokio::pin!(fast);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut fast)
+                .await
+                .is_err(),
+            "/fast must wait for the permit /slow holds"
+        );
+
+        release.notify_one();
+        let fast = fast.await.expect("infallible");
+        assert_eq!(fast.status(), axum::http::StatusCode::OK);
+        let slow = holder.await.expect("join").expect("infallible");
+        assert_eq!(slow.status(), axum::http::StatusCode::OK);
+    }
 
     #[test]
     fn should_list_each_method_and_path_once() {

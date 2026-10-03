@@ -5,10 +5,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use reqwest::{Method, StatusCode};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+use trenchers_arena_backend::proxy::{MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BODY_BYTES};
 use trenchers_arena_backend::routes::{Upstream, ROUTES};
 use trenchers_arena_backend::{app, Config};
 
@@ -76,6 +78,14 @@ impl Gateway {
         format!("{}{path}", self.base)
     }
 
+    async fn send(&self, method: Method, path: &str) -> reqwest::Response {
+        self.http
+            .request(method, self.url(path))
+            .send()
+            .await
+            .expect("the gateway answers")
+    }
+
     async fn received(&self, upstream: Upstream) -> Vec<Request> {
         let server = match upstream {
             Upstream::Platform => &self.api,
@@ -117,6 +127,11 @@ fn test_client() -> reqwest::Client {
         .expect("test client builds")
 }
 
+async fn json(response: reqwest::Response) -> Value {
+    let bytes = response.bytes().await.expect("read body");
+    serde_json::from_slice(&bytes).expect("JSON body")
+}
+
 fn header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
     request
         .headers
@@ -129,6 +144,24 @@ fn path_and_query(url: &reqwest::Url) -> String {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_owned(),
     }
+}
+
+/// Errors the gateway produces itself carry the platform API error body:
+/// `{ "error": <message>, "code": <status>, "category": <category> }`.
+fn assert_error_shape(body: &Value, status: u16, category: &str) {
+    let object = body.as_object().expect("the error body is a JSON object");
+    let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["category", "code", "error"]),
+        "error body keys: {body}"
+    );
+    assert!(
+        object["error"].as_str().is_some_and(|m| !m.is_empty()),
+        "error message: {body}"
+    );
+    assert_eq!(object["code"], status, "error code: {body}");
+    assert_eq!(object["category"], category, "error category: {body}");
 }
 
 // ---------------------------------------------------------------------------
@@ -508,4 +541,156 @@ async fn a_bodiless_action_is_forwarded_as_an_empty_post() {
     assert_eq!(header(got, "content-length"), Some("0"));
     assert_eq!(got.headers.get_all("content-length").iter().count(), 1);
     assert_eq!(header(got, "content-type"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upstream_bodies_pass_through_byte_for_byte() {
+    let gateway = Gateway::start().await;
+    // Unusual spacing and key order, an integer too big for f64, an escape and
+    // raw UTF-8. Re-serialising would change at least one of them.
+    let body: &[u8] = b"{ \"z\": 1,\n  \"a\":[1, 2,3], \"big\": 123456789012345678901234567890, \"s\": \"caf\\u00e9 \xe2\x9c\x93\" }\n";
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .mount(&gateway.api)
+        .await;
+    let response = gateway.send(Method::GET, "/me").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.expect("body"), body);
+}
+
+#[tokio::test]
+async fn upstream_error_statuses_and_bodies_pass_through_unchanged() {
+    let gateway = Gateway::start().await;
+    for status in [400, 401, 403, 404, 409, 410, 422, 429, 500, 502, 503] {
+        gateway.api.reset().await;
+        let body = format!(
+            r#"{{"error":"upstream said {status}","code":{status},"category":"validation"}}"#
+        );
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(status).set_body_raw(body.clone(), "application/json"),
+            )
+            .mount(&gateway.api)
+            .await;
+        let response = gateway.send(Method::GET, &format!("/bots/{BOT}")).await;
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.text().await.expect("body"), body, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn only_content_type_and_cache_control_come_back_from_the_upstream() {
+    let gateway = Gateway::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"entrants":[]}"#, "application/json; charset=utf-8")
+                .insert_header("cache-control", "private, max-age=10")
+                .insert_header("set-cookie", "upstream=1; Secure")
+                .insert_header("link", "</terminal/x/candles>; rel=\"canonical\"")
+                .insert_header("x-powered-by", "upstream")
+                .insert_header("access-control-allow-origin", "*")
+                .insert_header("strict-transport-security", "max-age=31536000")
+                .insert_header("x-request-id", "abc"),
+        )
+        .mount(&gateway.api)
+        .await;
+    let response = gateway
+        .send(Method::GET, &format!("/arena/entrants/{ENTRANT}"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers();
+    assert_eq!(headers["content-type"], "application/json; charset=utf-8");
+    assert_eq!(headers["cache-control"], "private, max-age=10");
+    let names: BTreeSet<&str> = headers.keys().map(|name| name.as_str()).collect();
+    let allowed = BTreeSet::from(["cache-control", "content-length", "content-type", "date"]);
+    assert!(
+        names.is_subset(&allowed),
+        "upstream headers that must not reach the app: {:?}",
+        names.difference(&allowed).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn indexer_refusals_pass_through_as_plain_text() {
+    let gateway = Gateway::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(400).set_body_raw("invalid res", "text/plain; charset=utf-8"),
+        )
+        .mount(&gateway.indexer)
+        .await;
+    let response = gateway
+        .send(Method::GET, &format!("/tokens/{MINT}/candles?res=7"))
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(response.text().await.expect("body"), "invalid res");
+}
+
+#[tokio::test]
+async fn large_upstream_bodies_pass_through() {
+    let gateway = Gateway::start().await;
+    let body = format!("[{}]", vec!["1234567890"; 300_000].join(","));
+    assert!(body.len() > 3 * MAX_REQUEST_BODY_BYTES);
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body.clone(), "application/json"))
+        .mount(&gateway.api)
+        .await;
+    let response = gateway
+        .send(
+            Method::GET,
+            &format!("/arena/entrants/{ENTRANT}/transcript?runs=50"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), body);
+}
+
+#[tokio::test]
+async fn an_oversized_upstream_body_answers_502() {
+    let gateway = Gateway::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![b' '; MAX_RESPONSE_BODY_BYTES + 1], "application/json"),
+        )
+        .mount(&gateway.api)
+        .await;
+    let response = gateway.send(Method::GET, "/bots").await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = json(response).await;
+    assert_error_shape(&body, 502, "upstream");
+}
+
+#[tokio::test]
+async fn upstream_redirects_are_returned_not_followed() {
+    let gateway = Gateway::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/elsewhere", gateway.indexer.uri())),
+        )
+        .mount(&gateway.api)
+        .await;
+    let response = gateway
+        .http
+        .get(gateway.url("/me"))
+        .header("authorization", "Bearer session.jwt")
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(response.headers().get("location").is_none());
+    assert!(
+        gateway.received(Upstream::Indexer).await.is_empty(),
+        "a redirect target must never receive the caller's request"
+    );
 }

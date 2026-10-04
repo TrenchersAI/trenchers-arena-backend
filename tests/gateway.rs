@@ -2,11 +2,12 @@
 //! servers (platform API and indexer), checking what each one receives.
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::{Method, StatusCode};
-use serde_json::Value;
-use tokio::net::TcpListener;
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -96,6 +97,20 @@ impl Gateway {
             .await
             .expect("request recording is on")
     }
+
+    async fn assert_no_upstream_calls(&self) {
+        for upstream in [Upstream::Platform, Upstream::Indexer] {
+            let received = self.received(upstream).await;
+            assert!(
+                received.is_empty(),
+                "{upstream} must not be called, but received: {:?}",
+                received
+                    .iter()
+                    .map(|r| format!("{} {}", r.method, r.url))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 /// Serves the gateway on an ephemeral port and returns its base URL.
@@ -125,6 +140,46 @@ fn test_client() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("test client builds")
+}
+
+/// A URL on a port nothing listens on.
+async fn closed_port_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("listener address");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// Sends a raw HTTP/1.1 request, so the target isn't normalised the way a URL
+/// parser would rewrite `..` or `%2e`. `head` must include `Connection: close`.
+async fn raw_request(base: &str, head: &str, body: &[u8]) -> (u16, String) {
+    let addr = base.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(head.as_bytes()).await.expect("write head");
+    // The gateway may answer (and stop reading) before the body is complete.
+    let _ = stream.write_all(body).await;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+    let text = String::from_utf8_lossy(&response).into_owned();
+    let status = text
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {text:?}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn raw_get(target: &str) -> String {
+    format!("GET {target} HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n")
 }
 
 async fn json(response: reqwest::Response) -> Value {
@@ -693,4 +748,327 @@ async fn upstream_redirects_are_returned_not_followed() {
         gateway.received(Upstream::Indexer).await.is_empty(),
         "a redirect target must never receive the caller's request"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The allowlist
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let cases: Vec<(Method, String)> = vec![
+        (Method::POST, "/admin/jobs/run".into()),
+        (Method::GET, "/admin/jobs/run".into()),
+        (Method::POST, "/ai/chat".into()),
+        (Method::GET, "/ai/chat".into()),
+        (Method::GET, "/admin/settings".into()),
+        (Method::POST, "/trade/swap".into()),
+        (Method::GET, "/metrics".into()),
+        (Method::GET, "/health/live".into()),
+        (Method::GET, "/ws".into()),
+        (Method::GET, "/".into()),
+        (Method::GET, "/bots/".into()),
+        (Method::GET, "/BOTS".into()),
+        // The indexer is reachable only through the renamed candles route.
+        (Method::GET, format!("/terminal/{MINT}/candles")),
+        (Method::GET, format!("/tokens/{MINT}/trades")),
+        // Platform API routes that aren't allowlisted.
+        (Method::POST, "/bots/import".into()),
+        (Method::POST, "/bots/export".into()),
+        (Method::POST, format!("/bots/{BOT}/withdraw")),
+        (Method::POST, format!("/bots/{BOT}/archive")),
+        (Method::GET, format!("/bots/{BOT}/config-history")),
+        (Method::GET, format!("/bots/{BOT}/auto-tune/transcript")),
+        (Method::POST, format!("/bots/{BOT}/ai/chat/stream")),
+        // Listed paths with a method that is not listed.
+        (Method::DELETE, format!("/bots/{BOT}")),
+        (Method::PATCH, format!("/bots/{BOT}/config")),
+        (Method::GET, format!("/bots/{BOT}/start")),
+        (Method::GET, "/auth/privy".into()),
+        (Method::DELETE, "/me".into()),
+        (Method::PUT, "/bots".into()),
+        (Method::GET, format!("/arena/entrants/{ENTRANT}/clone")),
+        (Method::OPTIONS, "/bots".into()),
+        (Method::POST, "/health".into()),
+    ];
+    for (method, path) in &cases {
+        let response = gateway.send(method.clone(), path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        let body: Value = json(response).await;
+        assert_error_shape(&body, 404, "validation");
+    }
+    // HEAD is not listed either; its 404 carries no body.
+    let response = gateway.send(Method::HEAD, "/bots").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "HEAD /bots");
+    gateway.assert_no_upstream_calls().await;
+}
+
+#[tokio::test]
+async fn static_bot_segments_are_never_captured_as_a_bot_id() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let statics = [
+        format!("/bots/stats?ids={BOT},{OTHER_BOT}"),
+        "/bots/leaderboard".to_owned(),
+        "/bots/defaults".to_owned(),
+    ];
+    for path in &statics {
+        let response = gateway.send(Method::GET, path).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path} must be forwarded, not refused as a malformed bot id"
+        );
+    }
+    let received: Vec<String> = gateway
+        .received(Upstream::Platform)
+        .await
+        .iter()
+        .map(|request| path_and_query(&request.url))
+        .collect();
+    assert_eq!(received, statics);
+
+    // A near miss is a bot id, and fails as one.
+    for path in [
+        "/bots/statsx",
+        "/bots/stat",
+        "/bots/leaderboards",
+        "/bots/default",
+    ] {
+        let response = gateway.send(Method::GET, path).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert_eq!(
+        gateway.received(Upstream::Platform).await.len(),
+        statics.len()
+    );
+}
+
+#[tokio::test]
+async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let cases: Vec<(Method, String)> = vec![
+        (Method::GET, "/bots/not-a-uuid".into()),
+        (
+            Method::GET,
+            "/bots/1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d1".into(),
+        ),
+        (
+            Method::GET,
+            "/bots/1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10ff".into(),
+        ),
+        (
+            Method::GET,
+            "/bots/zb4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10/stats".into(),
+        ),
+        (Method::PUT, "/bots/123/config".into()),
+        (Method::POST, "/bots/xyz/start".into()),
+        (Method::GET, "/bots/xyz/arena-clone".into()),
+        (Method::GET, "/arena/entrants/not-a-uuid".into()),
+        (Method::GET, "/arena/entrants/not-a-uuid/transcript".into()),
+        (Method::POST, "/arena/entrants/not-a-uuid/clone".into()),
+        (Method::GET, "/arena/seasons/six".into()),
+        (Method::GET, "/arena/seasons/1.5".into()),
+        (Method::GET, "/arena/seasons/99999999999".into()),
+        // Not base58 (0, O, I and l are outside the alphabet).
+        (
+            Method::GET,
+            "/tokens/0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl/candles".into(),
+        ),
+        (Method::GET, "/tokens/short/candles".into()),
+        (Method::GET, format!("/tokens/{MINT}xy/candles")),
+        // 44 base58 characters that decode to 44 bytes, not a 32-byte key.
+        (Method::GET, format!("/tokens/{}/candles", "1".repeat(44))),
+    ];
+    for (method, path) in &cases {
+        let response = gateway.send(method.clone(), path).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{method} {path}"
+        );
+        let body: Value = json(response).await;
+        assert_error_shape(&body, 400, "validation");
+    }
+
+    // Sent raw, because a URL parser would normalise these.
+    let raw_targets = [
+        "/bots/..".to_owned(),
+        "/bots/%2e%2e".to_owned(),
+        "/bots/..%2F..%2Fadmin%2Fsettings".to_owned(),
+        "/bots/%2e%2e/stats".to_owned(),
+        format!("/bots/{BOT}%2F..%2F..%2Fadmin"),
+        format!("/bots/{BOT}%20"),
+        "/tokens/..%2F..%2Fadmin%2Fsettings/candles".to_owned(),
+        "/arena/seasons/%36".to_owned(),
+    ];
+    for target in &raw_targets {
+        let (status, body) = raw_request(&gateway.base, &raw_get(target), b"").await;
+        assert_eq!(status, 400, "GET {target}");
+        let body: Value = serde_json::from_str(&body).expect("JSON error body");
+        assert_error_shape(&body, 400, "validation");
+    }
+    gateway.assert_no_upstream_calls().await;
+}
+
+#[tokio::test]
+async fn a_query_string_reaches_the_upstream_byte_for_byte() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    // A feed cursor sent without percent-encoding: `+` must not become a
+    // space and `|` must not be encoded on the way through.
+    let raw_cursor = "2026-10-01T12:00:00.123456+00:00|5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11|0";
+    let queries = [
+        format!("limit=30&before={raw_cursor}"),
+        format!("limit=30&before={FEED_CURSOR}"),
+        "limit=30&limit=31&before=&x=%41%2b+".to_owned(),
+    ];
+    for query in &queries {
+        let (status, _) = raw_request(
+            &gateway.base,
+            &raw_get(&format!("/arena/feed?{query}")),
+            b"",
+        )
+        .await;
+        assert_eq!(status, 200, "{query}");
+    }
+    let received: Vec<Option<String>> = gateway
+        .received(Upstream::Platform)
+        .await
+        .iter()
+        .map(|request| request.url.query().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        received,
+        queries.iter().cloned().map(Some).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn an_absolute_form_target_still_goes_to_the_configured_upstream() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let (status, _) = raw_request(&gateway.base, &raw_get("http://evil.example/me"), b"").await;
+    assert_eq!(status, 200);
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].url.path(), "/me");
+}
+
+#[tokio::test]
+async fn health_answers_without_calling_any_upstream() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let response = gateway.send(Method::GET, "/health").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = json(response).await;
+    assert_eq!(
+        body,
+        json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") })
+    );
+    gateway.assert_no_upstream_calls().await;
+}
+
+// ---------------------------------------------------------------------------
+// Limits and failures
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_body_at_the_limit_is_forwarded() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let body = vec![b'a'; MAX_REQUEST_BODY_BYTES];
+    let response = gateway
+        .http
+        .post(gateway.url("/bots"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(received[0].body.len(), MAX_REQUEST_BODY_BYTES);
+}
+
+#[tokio::test]
+async fn a_body_over_the_limit_answers_413_without_reaching_the_upstream() {
+    let gateway = Gateway::with_ok_upstreams().await;
+
+    // Declared too large: refused from the header alone.
+    let head = format!(
+        "POST /bots HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_REQUEST_BODY_BYTES + 1
+    );
+    let (status, body) = raw_request(&gateway.base, &head, b"").await;
+    assert_eq!(status, 413);
+    assert_error_shape(
+        &serde_json::from_str(&body).expect("JSON error body"),
+        413,
+        "validation",
+    );
+
+    // Chunked, so no length is declared: refused once the limit is crossed.
+    let size = MAX_REQUEST_BODY_BYTES + 1;
+    let head = format!(
+        "POST /bots HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{size:x}\r\n"
+    );
+    let (status, body) = raw_request(&gateway.base, &head, &vec![b'a'; size]).await;
+    assert_eq!(status, 413);
+    assert_error_shape(
+        &serde_json::from_str(&body).expect("JSON error body"),
+        413,
+        "validation",
+    );
+
+    gateway.assert_no_upstream_calls().await;
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_answers_502_in_the_error_shape() {
+    let indexer = MockServer::start().await;
+    let base = serve(
+        &closed_port_url().await,
+        &indexer.uri(),
+        Duration::from_secs(2),
+    )
+    .await;
+    let response = test_client()
+        .get(format!("{base}/me"))
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = json(response).await;
+    assert_error_shape(&body, 502, "upstream");
+
+    let api = MockServer::start().await;
+    let base = serve(&api.uri(), &closed_port_url().await, Duration::from_secs(2)).await;
+    let response = test_client()
+        .get(format!("{base}/tokens/{MINT}/candles?res=1"))
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = json(response).await;
+    assert_error_shape(&body, 502, "upstream");
+}
+
+#[tokio::test]
+async fn a_slow_upstream_answers_502_once_the_timeout_expires() {
+    let gateway = Gateway::start_with_timeout(Duration::from_millis(200)).await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"ok":true}"#, "application/json")
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&gateway.api)
+        .await;
+    let started = Instant::now();
+    let response = gateway.send(Method::GET, "/bots").await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the gateway must give up after its timeout, took {:?}",
+        started.elapsed()
+    );
+    let body: Value = json(response).await;
+    assert_error_shape(&body, 502, "upstream");
 }

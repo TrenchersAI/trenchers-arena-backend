@@ -2,6 +2,8 @@
 name = "trenchers-arena-backend"
 version = "0.1.0"
 edition = "2021"
+# The floor set by the locked dependency tree (the icu crates under `url`).
+rust-version = "1.88"
 description = "Backend for the Trenchers Arena mobile app: a gateway to its platform and indexer APIs"
 publish = false
 

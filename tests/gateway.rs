@@ -26,8 +26,10 @@ const REFRESH_BODY: &str = r#"{"token":"session.token.value"}"#;
 const CREATE_BOT_BODY: &str = r#"{"name":"Safe Flipper","config":{"sol_buy_amount_lamports":100000000,"exit_tiers":[{"mult_x":"2","pct_of_position":50,"slippage_override_bps":null}]},"paper_mode":true,"spend_limit_lamports":0,"required_acknowledged":["sol_buy_amount_lamports","exit_tiers"]}"#;
 const CONFIG_BODY: &str = r#"{"config":{"max_hold_secs":600},"required_acknowledged":["max_hold_secs"],"change_note":"Updated in Arena"}"#;
 const ALLOCATE_BODY: &str = r#"{"lamports":100000000}"#;
+const CLONE_KEY: &str = "clone-6a1f9c2e-entrant-5b0e8f0e";
 const CLONE_BODY: &str =
-    r#"{"name":"My Opus copy","idempotency_key":"5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11"}"#;
+    r#"{"name":"My Opus copy","idempotency_key":"clone-6a1f9c2e-entrant-5b0e8f0e"}"#;
+const CLONE_RESPONSE: &str = r#"{"bot_id":"9f3c2a71-5d4e-4b8a-8c1f-2e6d7a9b0c34","provenance":{"entrant_id":"5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11","season_number":10,"template_name":"Safe Flipper","model_id":"0d6b7c55-3c1e-4f3a-9a8b-6e2f1c4d5a90","model_name":"claude-opus","model_label":"Opus","label":"Cloned · Opus · Safe Flipper · S10","cloned_at":"2026-10-07T12:00:00Z"}}"#;
 
 /// An arena feed cursor as the app sends it, percent-encoded.
 const FEED_CURSOR: &str =
@@ -85,6 +87,18 @@ impl Gateway {
             .send()
             .await
             .expect("the gateway answers")
+    }
+
+    /// The request a contract case describes, without an `Authorization`
+    /// header.
+    fn request(&self, case: &Case) -> reqwest::RequestBuilder {
+        let request = self.http.request(case.method.clone(), self.url(&case.path));
+        match case.body {
+            Some(body) => request
+                .header("content-type", "application/json")
+                .body(body),
+            None => request,
+        }
     }
 
     async fn received(&self, upstream: Upstream) -> Vec<Request> {
@@ -751,6 +765,321 @@ async fn upstream_redirects_are_returned_not_followed() {
 }
 
 // ---------------------------------------------------------------------------
+// Arena
+// ---------------------------------------------------------------------------
+
+/// The twelve arena routes in the contract, including the clone provenance
+/// read that lives under `/bots`.
+fn arena_cases() -> Vec<Case> {
+    contract()
+        .into_iter()
+        .filter(|case| {
+            case.pattern.starts_with("/arena/") || case.pattern == "/bots/{id}/arena-clone"
+        })
+        .collect()
+}
+
+/// Arena routes whose handler takes no token. Only the gate looks at one.
+const PUBLIC_ARENA_PATTERNS: [&str; 5] = [
+    "/arena/season",
+    "/arena/entrants/{id}",
+    "/arena/feed",
+    "/arena/seasons",
+    "/arena/seasons/{number}",
+];
+
+#[test]
+fn the_contract_lists_all_twelve_arena_routes() {
+    let patterns: Vec<&str> = arena_cases().iter().map(|case| case.pattern).collect();
+    assert_eq!(patterns.len(), 12, "{patterns:?}");
+    for pattern in PUBLIC_ARENA_PATTERNS {
+        assert!(patterns.contains(&pattern), "{pattern}");
+    }
+}
+
+#[tokio::test]
+async fn public_arena_routes_are_forwarded_without_a_token() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let public = [
+        "/arena/season".to_owned(),
+        format!("/arena/entrants/{ENTRANT}"),
+        "/arena/feed".to_owned(),
+        format!("/arena/feed?limit=30&before={FEED_CURSOR}"),
+        "/arena/seasons".to_owned(),
+        "/arena/seasons/6".to_owned(),
+    ];
+    for path in &public {
+        let response = gateway.send(Method::GET, path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    let received = gateway.received(Upstream::Platform).await;
+    let paths: Vec<String> = received
+        .iter()
+        .map(|request| path_and_query(&request.url))
+        .collect();
+    assert_eq!(paths, public);
+    for request in &received {
+        assert_eq!(header(request, "authorization"), None, "{}", request.url);
+    }
+}
+
+/// The gateway does not check tokens. A signed-in route without one is still
+/// forwarded, and the platform's 401 comes back as it sent it.
+#[tokio::test]
+async fn signed_in_arena_routes_leave_the_401_to_the_platform() {
+    let gateway = Gateway::start().await;
+    let body = r#"{"error":"authentication required","code":401,"category":"not_authorized"}"#;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(401).set_body_raw(body, "application/json"))
+        .mount(&gateway.api)
+        .await;
+    let signed_in: Vec<Case> = arena_cases()
+        .into_iter()
+        .filter(|case| !PUBLIC_ARENA_PATTERNS.contains(&case.pattern))
+        .collect();
+    assert_eq!(signed_in.len(), 7);
+    for case in &signed_in {
+        let label = format!("{} {}", case.method, case.path);
+        let response = gateway
+            .request(case)
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{label}");
+        assert_eq!(response.text().await.expect("body"), body, "{label}");
+    }
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(received.len(), signed_in.len());
+    for request in &received {
+        assert_eq!(header(request, "authorization"), None, "{}", request.url);
+    }
+}
+
+/// With the arena flag off, the platform answers 404 with a JSON body whose
+/// category is `internal`. The gateway must not swap in its own 404, which
+/// says `validation`.
+#[tokio::test]
+async fn a_closed_arena_gate_404_passes_through_unchanged() {
+    let gateway = Gateway::start().await;
+    for case in arena_cases() {
+        let path = case.path.split('?').next().expect("a path").to_owned();
+        let body =
+            format!(r#"{{"error":"arena not found: {path}","code":404,"category":"internal"}}"#);
+        for token in [None, Some("Bearer session.jwt")] {
+            let label = format!("{} {} (token: {})", case.method, case.path, token.is_some());
+            gateway.api.reset().await;
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(404).set_body_raw(body.clone(), "application/json"),
+                )
+                .mount(&gateway.api)
+                .await;
+            let mut request = gateway.request(&case);
+            if let Some(token) = token {
+                request = request.header("authorization", token);
+            }
+            let response = request.send().await.expect("the gateway answers");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/json",
+                "{label}"
+            );
+            assert_eq!(response.text().await.expect("body"), body, "{label}");
+            let received = gateway.received(Upstream::Platform).await;
+            assert_eq!(received.len(), 1, "{label}: forwarded once");
+            assert_eq!(header(&received[0], "authorization"), token, "{label}");
+        }
+    }
+}
+
+/// The platform's own unknown-route 404 has an empty body; it stays empty.
+#[tokio::test]
+async fn an_empty_upstream_404_stays_empty() {
+    let gateway = Gateway::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&gateway.api)
+        .await;
+    let response = gateway.send(Method::GET, "/arena/season").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.bytes().await.expect("body").is_empty());
+}
+
+#[tokio::test]
+async fn a_clone_and_its_retry_reach_the_platform_with_body_and_idempotency_key_intact() {
+    let gateway = Gateway::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(CLONE_RESPONSE, "application/json"))
+        .mount(&gateway.api)
+        .await;
+    let path = format!("/arena/entrants/{ENTRANT}/clone");
+    // The app retries a failed clone with the same key; the platform answers
+    // the replay with the same 200 body.
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let response = gateway
+            .http
+            .post(gateway.url(&path))
+            .header("authorization", "Bearer session.jwt")
+            .header("content-type", "application/json")
+            .header("idempotency-key", CLONE_KEY)
+            .body(CLONE_BODY)
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        answers.push(response.text().await.expect("body"));
+    }
+    assert_eq!(answers, [CLONE_RESPONSE, CLONE_RESPONSE]);
+
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(
+        received.len(),
+        2,
+        "the gateway neither retries nor deduplicates"
+    );
+    for got in &received {
+        assert_eq!(got.method, Method::POST);
+        assert_eq!(got.url.path(), path);
+        assert_eq!(got.body, CLONE_BODY.as_bytes());
+        let body: Value = serde_json::from_slice(&got.body).expect("JSON body");
+        assert_eq!(body["idempotency_key"], CLONE_KEY);
+        assert_eq!(header(got, "content-type"), Some("application/json"));
+        assert_eq!(header(got, "idempotency-key"), Some(CLONE_KEY));
+        assert_eq!(header(got, "authorization"), Some("Bearer session.jwt"));
+    }
+}
+
+/// Clone refusals, JSON or the platform's plain-text body rejections, come
+/// back with their status, type and body.
+#[tokio::test]
+async fn clone_refusals_pass_through_unchanged() {
+    let gateway = Gateway::start().await;
+    let cases = [
+        (
+            404,
+            "application/json",
+            format!(r#"{{"error":"arena_clone not found: {BOT}","code":404,"category":"internal"}}"#),
+        ),
+        (
+            409,
+            "application/json",
+            r#"{"error":"a clone with this idempotency key is already being created","code":409,"category":"validation"}"#.to_owned(),
+        ),
+        (
+            415,
+            "text/plain; charset=utf-8",
+            "Expected request with `Content-Type: application/json`".to_owned(),
+        ),
+        (
+            422,
+            "text/plain; charset=utf-8",
+            "Failed to deserialize the JSON body into the target type: missing field `name`"
+                .to_owned(),
+        ),
+    ];
+    for (status, content_type, body) in cases {
+        gateway.api.reset().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(status).set_body_raw(body.clone(), content_type))
+            .mount(&gateway.api)
+            .await;
+        let response = gateway
+            .http
+            .post(gateway.url(&format!("/arena/entrants/{ENTRANT}/clone")))
+            .header("authorization", "Bearer session.jwt")
+            .header("content-type", "application/json")
+            .body(CLONE_BODY)
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["content-type"], content_type, "{status}");
+        assert_eq!(response.text().await.expect("body"), body, "{status}");
+    }
+}
+
+/// The platform clamps `limit` and `runs` and rejects a bad cursor. The
+/// gateway forwards the query as sent and leaves those decisions to it.
+#[tokio::test]
+async fn arena_query_strings_are_forwarded_without_clamping_or_checks() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let paths = [
+        format!("/arena/entrants/{ENTRANT}/trades?limit=0"),
+        format!("/arena/entrants/{ENTRANT}/trades?limit=9999"),
+        format!("/arena/entrants/{ENTRANT}/config-history?limit=abc"),
+        format!("/arena/entrants/{ENTRANT}/transcript?runs=-1"),
+        "/arena/feed?limit=500&before=not-a-cursor".to_owned(),
+        "/arena/seasons/6?unused=1".to_owned(),
+    ];
+    for path in &paths {
+        let response = gateway
+            .http
+            .get(gateway.url(path))
+            .header("authorization", "Bearer session.jwt")
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    let received: Vec<String> = gateway
+        .received(Upstream::Platform)
+        .await
+        .iter()
+        .map(|request| path_and_query(&request.url))
+        .collect();
+    assert_eq!(received, paths);
+}
+
+#[tokio::test]
+async fn arena_cache_control_comes_back_as_the_platform_set_it() {
+    let gateway = Gateway::start().await;
+    for (path, cache_control) in [
+        ("/arena/season".to_owned(), "public, max-age=30"),
+        ("/arena/feed".to_owned(), "public, max-age=15"),
+        (
+            format!("/arena/feed?before={FEED_CURSOR}"),
+            "public, max-age=3600",
+        ),
+        (
+            "/arena/seasons".to_owned(),
+            "public, max-age=86400, immutable",
+        ),
+        (
+            "/arena/seasons/6".to_owned(),
+            "public, max-age=86400, immutable",
+        ),
+        (format!("/arena/entrants/{ENTRANT}"), "public, max-age=10"),
+    ] {
+        gateway.api.reset().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"ok":true}"#, "application/json")
+                    .insert_header("cache-control", cache_control),
+            )
+            .mount(&gateway.api)
+            .await;
+        let response = gateway.send(Method::GET, &path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(response.headers()["cache-control"], cache_control, "{path}");
+    }
+
+    // The dashboard tabs set no Cache-Control, and the gateway adds none.
+    gateway.api.reset().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+        .mount(&gateway.api)
+        .await;
+    let response = gateway
+        .send(Method::GET, &format!("/arena/entrants/{ENTRANT}/trades"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("cache-control").is_none());
+}
+
+// ---------------------------------------------------------------------------
 // The allowlist
 // ---------------------------------------------------------------------------
 
@@ -789,6 +1118,20 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::DELETE, "/me".into()),
         (Method::PUT, "/bots".into()),
         (Method::GET, format!("/arena/entrants/{ENTRANT}/clone")),
+        (Method::PUT, format!("/arena/entrants/{ENTRANT}/clone")),
+        (Method::POST, "/arena/season".into()),
+        (Method::POST, format!("/bots/{BOT}/arena-clone")),
+        // Arena paths that only look like listed ones.
+        (Method::GET, "/arena".into()),
+        (Method::GET, "/arena/entrants".into()),
+        (Method::GET, format!("/arena/entrants/{ENTRANT}/unknown")),
+        (
+            Method::GET,
+            format!("/arena/entrants/{ENTRANT}/trades/extra"),
+        ),
+        (Method::GET, "/arena/seasons/6/entrants".into()),
+        (Method::GET, format!("/bots/{BOT}/arena-clone/extra")),
+        (Method::GET, "/admin/arena/seasons".into()),
         (Method::OPTIONS, "/bots".into()),
         (Method::POST, "/health".into()),
     ];
@@ -865,9 +1208,21 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         (Method::POST, "/bots/xyz/start".into()),
         (Method::GET, "/bots/xyz/arena-clone".into()),
         (Method::GET, "/arena/entrants/not-a-uuid".into()),
+        (Method::GET, "/arena/entrants/not-a-uuid/positions".into()),
+        (
+            Method::GET,
+            "/arena/entrants/not-a-uuid/trades?limit=50".into(),
+        ),
+        (Method::GET, "/arena/entrants/not-a-uuid/watching".into()),
+        (
+            Method::GET,
+            "/arena/entrants/not-a-uuid/config-history".into(),
+        ),
         (Method::GET, "/arena/entrants/not-a-uuid/transcript".into()),
         (Method::POST, "/arena/entrants/not-a-uuid/clone".into()),
+        (Method::GET, format!("/arena/entrants/{MINT}")),
         (Method::GET, "/arena/seasons/six".into()),
+        (Method::GET, "/arena/seasons/6x".into()),
         (Method::GET, "/arena/seasons/1.5".into()),
         (Method::GET, "/arena/seasons/99999999999".into()),
         // Not base58 (0, O, I and l are outside the alphabet).
@@ -901,6 +1256,11 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         format!("/bots/{BOT}%20"),
         "/tokens/..%2F..%2Fadmin%2Fsettings/candles".to_owned(),
         "/arena/seasons/%36".to_owned(),
+        "/arena/seasons/..".to_owned(),
+        "/arena/entrants/%2e%2e/trades".to_owned(),
+        "/arena/entrants/..%2F..%2Fadmin%2Farena/transcript".to_owned(),
+        format!("/arena/entrants/{ENTRANT}%2F..%2F..%2Fadmin"),
+        format!("/bots/{BOT}%2F..%2F..%2Farena/arena-clone"),
     ];
     for target in &raw_targets {
         let (status, body) = raw_request(&gateway.base, &raw_get(target), b"").await;

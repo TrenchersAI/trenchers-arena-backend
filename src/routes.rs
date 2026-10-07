@@ -445,5 +445,66 @@ mod tests {
                 );
             }
         }
+
+        /// Arena paths that share a prefix each reach their own pattern, in
+        /// either registration order, and a deeper path is not cut short.
+        #[tokio::test]
+        async fn arena_paths_with_a_shared_prefix_reach_their_own_route() {
+            let id = "5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11";
+            for (label, router) in [
+                ("table order", echo_router(ROUTES.iter())),
+                ("reverse order", echo_router(ROUTES.iter().rev())),
+            ] {
+                let build = || router.clone();
+                let cases = [
+                    ("/arena/season".to_owned(), "/arena/season"),
+                    ("/arena/seasons".to_owned(), "/arena/seasons"),
+                    ("/arena/seasons/6".to_owned(), "/arena/seasons/{number}"),
+                    (format!("/arena/entrants/{id}"), "/arena/entrants/{id}"),
+                    (
+                        format!("/arena/entrants/{id}/positions"),
+                        "/arena/entrants/{id}/positions",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/trades"),
+                        "/arena/entrants/{id}/trades",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/watching"),
+                        "/arena/entrants/{id}/watching",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/config-history"),
+                        "/arena/entrants/{id}/config-history",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/transcript"),
+                        "/arena/entrants/{id}/transcript",
+                    ),
+                    (format!("/bots/{id}"), "/bots/{id}"),
+                    (format!("/bots/{id}/arena-clone"), "/bots/{id}/arena-clone"),
+                ];
+                for (uri, pattern) in &cases {
+                    assert_eq!(
+                        matched(build(), uri).await,
+                        (StatusCode::OK, (*pattern).to_owned()),
+                        "{label}: {uri}"
+                    );
+                }
+                // No pattern swallows a longer path.
+                for uri in [
+                    format!("/arena/entrants/{id}/unknown"),
+                    format!("/arena/entrants/{id}/trades/extra"),
+                    "/arena/seasons/6/entrants".to_owned(),
+                    format!("/bots/{id}/arena-clone/extra"),
+                ] {
+                    assert_eq!(
+                        matched(build(), &uri).await.0,
+                        StatusCode::NOT_FOUND,
+                        "{label}: {uri}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -14,8 +14,14 @@ use crate::error::GatewayError;
 use crate::proxy::Proxy;
 use Verb::{Get, Post, Put};
 
-/// Max in-flight requests to the platform API. Requests over the limit wait.
+/// Max in-flight requests to the platform API, other than the Arena routes.
+/// Requests over a limit wait.
 const PLATFORM_CONCURRENCY: usize = 64;
+
+/// Max in-flight Arena requests. The app polls these, so they get their own
+/// limit and slow Arena reads can't delay sign-ins or bot actions. The
+/// platform gives each of its three Arena groups 20 permits.
+const ARENA_CONCURRENCY: usize = 32;
 
 /// Max in-flight chart requests, kept separate so chart traffic can't delay
 /// sign-ins or bot actions.
@@ -36,6 +42,14 @@ impl fmt::Display for Upstream {
             Self::Indexer => "indexer-api",
         })
     }
+}
+
+/// The concurrency limit a route counts against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    Platform,
+    Arena,
+    Indexer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +80,15 @@ pub struct Route {
 }
 
 impl Route {
+    pub fn limit(&self) -> Limit {
+        let arena = self.path.starts_with("/arena/") || self.path == "/bots/{id}/arena-clone";
+        match self.upstream {
+            Upstream::Indexer => Limit::Indexer,
+            Upstream::Platform if arena => Limit::Arena,
+            Upstream::Platform => Limit::Platform,
+        }
+    }
+
     /// Returns each `{name}` in the pattern with the matching raw (still
     /// percent-encoded) segment of `path`, or `None` if the shapes differ.
     pub fn params<'p>(&self, path: &'p str) -> Option<Vec<(&'static str, &'p str)>> {
@@ -169,8 +192,9 @@ pub static ROUTES: &[Route] = &[
 /// everything else, including a known path with the wrong method.
 pub fn router(proxy: Proxy) -> Router {
     Router::new()
-        .merge(limited(group(Upstream::Platform), PLATFORM_CONCURRENCY))
-        .merge(limited(group(Upstream::Indexer), INDEXER_CONCURRENCY))
+        .merge(limited(group(Limit::Platform), PLATFORM_CONCURRENCY))
+        .merge(limited(group(Limit::Arena), ARENA_CONCURRENCY))
+        .merge(limited(group(Limit::Indexer), INDEXER_CONCURRENCY))
         // Outside the limits, so health checks never wait behind upstream calls.
         .route("/health", get(health))
         .fallback(not_found)
@@ -179,10 +203,10 @@ pub fn router(proxy: Proxy) -> Router {
         .with_state(proxy)
 }
 
-fn group(upstream: Upstream) -> Router<Proxy> {
+fn group(limit: Limit) -> Router<Proxy> {
     ROUTES
         .iter()
-        .filter(|route| route.upstream == upstream)
+        .filter(|route| route.limit() == limit)
         .fold(Router::new(), |router, route| {
             router.route(route.path, forwarding(route))
         })
@@ -271,6 +295,29 @@ mod tests {
         assert_eq!(fast.status(), axum::http::StatusCode::OK);
         let slow = holder.await.expect("join").expect("infallible");
         assert_eq!(slow.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn should_give_the_arena_routes_their_own_limit() {
+        let arena: Vec<&str> = ROUTES
+            .iter()
+            .filter(|route| route.limit() == Limit::Arena)
+            .map(|route| route.path)
+            .collect();
+        assert_eq!(arena.len(), 12, "all twelve Arena routes: {arena:?}");
+        assert!(arena.contains(&"/bots/{id}/arena-clone"));
+        for route in ROUTES {
+            if route.path.starts_with("/auth/") || route.path == "/bots/{id}/pause" {
+                assert_eq!(route.limit(), Limit::Platform, "{}", route.path);
+            }
+        }
+        assert_eq!(
+            ROUTES
+                .iter()
+                .filter(|route| route.limit() == Limit::Indexer)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -443,6 +490,67 @@ mod tests {
                     (StatusCode::OK, "/bots/{id}/stats".to_owned()),
                     "{label}: the per-bot stats route is distinct from the batch"
                 );
+            }
+        }
+
+        /// Arena paths that share a prefix each reach their own pattern, in
+        /// either registration order, and a deeper path is not cut short.
+        #[tokio::test]
+        async fn arena_paths_with_a_shared_prefix_reach_their_own_route() {
+            let id = "5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11";
+            for (label, router) in [
+                ("table order", echo_router(ROUTES.iter())),
+                ("reverse order", echo_router(ROUTES.iter().rev())),
+            ] {
+                let build = || router.clone();
+                let cases = [
+                    ("/arena/season".to_owned(), "/arena/season"),
+                    ("/arena/seasons".to_owned(), "/arena/seasons"),
+                    ("/arena/seasons/6".to_owned(), "/arena/seasons/{number}"),
+                    (format!("/arena/entrants/{id}"), "/arena/entrants/{id}"),
+                    (
+                        format!("/arena/entrants/{id}/positions"),
+                        "/arena/entrants/{id}/positions",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/trades"),
+                        "/arena/entrants/{id}/trades",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/watching"),
+                        "/arena/entrants/{id}/watching",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/config-history"),
+                        "/arena/entrants/{id}/config-history",
+                    ),
+                    (
+                        format!("/arena/entrants/{id}/transcript"),
+                        "/arena/entrants/{id}/transcript",
+                    ),
+                    (format!("/bots/{id}"), "/bots/{id}"),
+                    (format!("/bots/{id}/arena-clone"), "/bots/{id}/arena-clone"),
+                ];
+                for (uri, pattern) in &cases {
+                    assert_eq!(
+                        matched(build(), uri).await,
+                        (StatusCode::OK, (*pattern).to_owned()),
+                        "{label}: {uri}"
+                    );
+                }
+                // No pattern swallows a longer path.
+                for uri in [
+                    format!("/arena/entrants/{id}/unknown"),
+                    format!("/arena/entrants/{id}/trades/extra"),
+                    "/arena/seasons/6/entrants".to_owned(),
+                    format!("/bots/{id}/arena-clone/extra"),
+                ] {
+                    assert_eq!(
+                        matched(build(), &uri).await.0,
+                        StatusCode::NOT_FOUND,
+                        "{label}: {uri}"
+                    );
+                }
             }
         }
     }

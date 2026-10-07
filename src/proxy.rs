@@ -28,6 +28,9 @@ pub const USER_AGENT: &str = concat!("trenchers-arena-backend/", env!("CARGO_PKG
 /// cookies and client-supplied `X-Forwarded-*` / `CF-*` headers, which the
 /// platform API would treat as the client's address.
 ///
+/// `Authorization` goes to the platform API only. The indexer serves public
+/// charts and never reads it, so a session token has no reason to go there.
+///
 /// reqwest adds `Host`, `User-Agent` and `Content-Length`, plus `Accept: */*`
 /// when the client sent no `Accept`.
 pub static FORWARDED_REQUEST_HEADERS: [HeaderName; 4] = [
@@ -150,6 +153,9 @@ impl Proxy {
 
         let mut upstream = self.client.request(parts.method.clone(), url);
         for name in &FORWARDED_REQUEST_HEADERS {
+            if name == header::AUTHORIZATION && route.upstream == Upstream::Indexer {
+                continue;
+            }
             for value in parts.headers.get_all(name) {
                 let mut value = value.clone();
                 value.set_sensitive(name == header::AUTHORIZATION);

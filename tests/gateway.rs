@@ -491,9 +491,14 @@ async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact
             case.body.unwrap_or_default().as_bytes(),
             "{label}: body"
         );
+        // The indexer never reads a session token, so it never gets one.
+        let authorization = match case.upstream {
+            Upstream::Platform => Some("Bearer session.jwt"),
+            Upstream::Indexer => None,
+        };
         assert_eq!(
             header(got, "authorization"),
-            Some("Bearer session.jwt"),
+            authorization,
             "{label}: authorization"
         );
     }
@@ -1408,6 +1413,76 @@ async fn an_unreachable_upstream_answers_502_in_the_error_shape() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body: Value = json(response).await;
     assert_error_shape(&body, 502, "upstream");
+}
+
+/// Arena reads have their own concurrency limit: while slow ones fill it, a
+/// sign-in still goes straight through.
+#[tokio::test]
+async fn slow_arena_reads_do_not_delay_a_sign_in() {
+    const ARENA_DELAY: Duration = Duration::from_secs(3);
+    let gateway = Gateway::start().await;
+    Mock::given(wiremock::matchers::path("/arena/feed"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"items":[]}"#, "application/json")
+                .set_delay(ARENA_DELAY),
+        )
+        .mount(&gateway.api)
+        .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"))
+        .mount(&gateway.api)
+        .await;
+
+    // More polls than the whole platform limit (64), so a shared limit would
+    // leave the sign-in queued behind them.
+    let polls: Vec<_> = (0..80)
+        .map(|_| {
+            let request = gateway.http.get(gateway.url("/arena/feed"));
+            tokio::spawn(request.send())
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = Instant::now();
+    let response = gateway
+        .http
+        .post(gateway.url("/auth/privy"))
+        .header("content-type", "application/json")
+        .body(PRIVY_BODY)
+        .send()
+        .await
+        .expect("the gateway answers");
+    let waited = started.elapsed();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        waited < Duration::from_secs(1),
+        "the sign-in waited {waited:?} behind Arena reads"
+    );
+
+    for poll in polls {
+        let response = poll.await.expect("join").expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+/// The upstream timeout also bounds reading the request body; a client that
+/// stops sending gets a 408, and nothing goes upstream.
+#[tokio::test]
+async fn a_stalled_request_body_answers_408_once_the_timeout_expires() {
+    let gateway = Gateway::start_with_timeout(Duration::from_millis(200)).await;
+    let head = format!(
+        "POST /bots/{BOT}/allocate HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
+    );
+    let started = Instant::now();
+    let (status, _) = raw_request(&gateway.base, &head, br#"{"lamports":"#).await;
+    assert_eq!(status, 408);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    gateway.assert_no_upstream_calls().await;
 }
 
 #[tokio::test]

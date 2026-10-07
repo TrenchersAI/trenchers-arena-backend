@@ -14,8 +14,14 @@ use crate::error::GatewayError;
 use crate::proxy::Proxy;
 use Verb::{Get, Post, Put};
 
-/// Max in-flight requests to the platform API. Requests over the limit wait.
+/// Max in-flight requests to the platform API, other than the Arena routes.
+/// Requests over a limit wait.
 const PLATFORM_CONCURRENCY: usize = 64;
+
+/// Max in-flight Arena requests. The app polls these, so they get their own
+/// limit and slow Arena reads can't delay sign-ins or bot actions. The
+/// platform gives each of its three Arena groups 20 permits.
+const ARENA_CONCURRENCY: usize = 32;
 
 /// Max in-flight chart requests, kept separate so chart traffic can't delay
 /// sign-ins or bot actions.
@@ -36,6 +42,14 @@ impl fmt::Display for Upstream {
             Self::Indexer => "indexer-api",
         })
     }
+}
+
+/// The concurrency limit a route counts against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    Platform,
+    Arena,
+    Indexer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +80,15 @@ pub struct Route {
 }
 
 impl Route {
+    pub fn limit(&self) -> Limit {
+        let arena = self.path.starts_with("/arena/") || self.path == "/bots/{id}/arena-clone";
+        match self.upstream {
+            Upstream::Indexer => Limit::Indexer,
+            Upstream::Platform if arena => Limit::Arena,
+            Upstream::Platform => Limit::Platform,
+        }
+    }
+
     /// Returns each `{name}` in the pattern with the matching raw (still
     /// percent-encoded) segment of `path`, or `None` if the shapes differ.
     pub fn params<'p>(&self, path: &'p str) -> Option<Vec<(&'static str, &'p str)>> {
@@ -169,8 +192,9 @@ pub static ROUTES: &[Route] = &[
 /// everything else, including a known path with the wrong method.
 pub fn router(proxy: Proxy) -> Router {
     Router::new()
-        .merge(limited(group(Upstream::Platform), PLATFORM_CONCURRENCY))
-        .merge(limited(group(Upstream::Indexer), INDEXER_CONCURRENCY))
+        .merge(limited(group(Limit::Platform), PLATFORM_CONCURRENCY))
+        .merge(limited(group(Limit::Arena), ARENA_CONCURRENCY))
+        .merge(limited(group(Limit::Indexer), INDEXER_CONCURRENCY))
         // Outside the limits, so health checks never wait behind upstream calls.
         .route("/health", get(health))
         .fallback(not_found)
@@ -179,10 +203,10 @@ pub fn router(proxy: Proxy) -> Router {
         .with_state(proxy)
 }
 
-fn group(upstream: Upstream) -> Router<Proxy> {
+fn group(limit: Limit) -> Router<Proxy> {
     ROUTES
         .iter()
-        .filter(|route| route.upstream == upstream)
+        .filter(|route| route.limit() == limit)
         .fold(Router::new(), |router, route| {
             router.route(route.path, forwarding(route))
         })
@@ -271,6 +295,29 @@ mod tests {
         assert_eq!(fast.status(), axum::http::StatusCode::OK);
         let slow = holder.await.expect("join").expect("infallible");
         assert_eq!(slow.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn should_give_the_arena_routes_their_own_limit() {
+        let arena: Vec<&str> = ROUTES
+            .iter()
+            .filter(|route| route.limit() == Limit::Arena)
+            .map(|route| route.path)
+            .collect();
+        assert_eq!(arena.len(), 12, "all twelve Arena routes: {arena:?}");
+        assert!(arena.contains(&"/bots/{id}/arena-clone"));
+        for route in ROUTES {
+            if route.path.starts_with("/auth/") || route.path == "/bots/{id}/pause" {
+                assert_eq!(route.limit(), Limit::Platform, "{}", route.path);
+            }
+        }
+        assert_eq!(
+            ROUTES
+                .iter()
+                .filter(|route| route.limit() == Limit::Indexer)
+                .count(),
+            1
+        );
     }
 
     #[test]

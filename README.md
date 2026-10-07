@@ -22,9 +22,15 @@ What the gateway does on every request:
 2. Check each path parameter (`src/validate.rs`). A bad one: a JSON 400, and nothing is
    sent upstream.
 3. Forward the request: same method, path and query string, the request body, and only
-   the `Authorization`, `Content-Type`, `Accept` and `Idempotency-Key` headers.
+   the `Content-Type`, `Accept` and `Idempotency-Key` headers, plus `Authorization` for
+   the platform API. The indexer never reads a session token, so it never gets one.
 4. Return the upstream status and body unchanged, with only `Content-Type` and
    `Cache-Control` copied back.
+
+Each group of routes has its own limit on in-flight requests (`src/routes.rs`): 64 for
+the platform API, 32 for the Arena routes and 32 for charts. A request over its group's
+limit waits. The app polls the Arena routes, so slow Arena reads fill only their own
+limit and never make a sign-in or a bot action wait.
 
 The gateway does not check tokens, clamp query values or cache anything. The platform
 API does all of that, and its answers (including 401, 404 and plain-text errors) come
@@ -131,11 +137,32 @@ Read from environment variables only (`src/config.rs`). See `.env.example`.
 | `PLATFORM_API_URL` | yes | | Platform API origin, `https://host[:port]`. Plain `http` only for localhost. |
 | `INDEXER_API_URL` | yes | | Indexer API origin, same rules. |
 | `PORT` | no | `8080` | Port to listen on. The gateway always binds all interfaces (`0.0.0.0`). |
-| `UPSTREAM_TIMEOUT_MS` | no | `15000` | Limit for one upstream call, including its body. On expiry: 502. |
+| `UPSTREAM_TIMEOUT_MS` | no | `15000` | Used twice: as the limit for reading the client's request body (on expiry: 408), and separately as the limit for one upstream call, including its response body (on expiry: 502). A slow body followed by a slow upstream can take up to twice this value. |
 | `RUST_LOG` | no | `info` | Log filter. |
 
 The URLs must be bare origins: no path, query, fragment or credentials. Do not commit
 real service URLs; keep them in `.env` (git-ignored) or the host's settings.
+
+## Known limit: sign-in rate limits are shared
+
+Read this before pointing the gateway at real users.
+
+The platform API rate-limits `POST /auth/privy` (20 per minute) and `POST /auth/refresh`
+(120 per minute) per client IP. It takes the client IP only from `CF-Connecting-IP`, the
+header Cloudflare sets, and puts every caller without it in one shared bucket. It
+deliberately ignores `X-Forwarded-For`, because clients can fake it.
+
+The gateway drops all client-IP headers, so the platform sees every app user as one
+caller: either the shared bucket or the gateway's own address. Across the whole user
+base that is 20 sign-ins and 120 refreshes per minute in total. The 21st sign-in in a
+minute gets `429` even if that user tried once.
+
+Forwarding `CF-Connecting-IP` from the gateway does not fix this: a client could set it
+to anything, and Cloudflare in front of the platform would overwrite it. The fix needs a
+platform API change, for example trusting a client-IP header only from the gateway (with
+a shared secret), or giving the gateway its own larger budget while the gateway limits
+sign-ins per client IP itself. Until then, this gateway is fine for testing and small
+groups, not for a public launch.
 
 ## Running locally
 

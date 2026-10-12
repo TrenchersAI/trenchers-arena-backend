@@ -24,10 +24,6 @@ const PLATFORM_CONCURRENCY: usize = 64;
 /// platform gives each of its three Arena groups 20 permits.
 const ARENA_CONCURRENCY: usize = 32;
 
-/// Max in-flight chart requests, kept separate so chart traffic can't delay
-/// sign-ins or bot actions.
-const INDEXER_CONCURRENCY: usize = 32;
-
 /// Max in-flight requests that move money (swaps, orders, transfers). Their
 /// own limit, so a swap never waits behind the app's polling. Above the
 /// platform's own money cap (10, shared with the web app and queued there), so
@@ -38,15 +34,12 @@ const TRADE_CONCURRENCY: usize = 16;
 pub enum Upstream {
     /// The platform API, at `PLATFORM_API_URL`.
     Platform,
-    /// The indexer API, at `INDEXER_API_URL`.
-    Indexer,
 }
 
 impl fmt::Display for Upstream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Platform => "platform-api",
-            Self::Indexer => "indexer-api",
         })
     }
 }
@@ -56,7 +49,6 @@ impl fmt::Display for Upstream {
 pub enum Limit {
     Platform,
     Arena,
-    Indexer,
     Trade,
     /// AI answers streamed as server-sent events. Not a tower layer: the
     /// permit has to last until the stream ends, so the proxy takes it and
@@ -115,7 +107,6 @@ impl Route {
         }
         let arena = self.path.starts_with("/arena/") || self.path == "/bots/{id}/arena-clone";
         match self.upstream {
-            Upstream::Indexer => Limit::Indexer,
             Upstream::Platform if arena => Limit::Arena,
             Upstream::Platform => Limit::Platform,
         }
@@ -236,16 +227,6 @@ pub static ROUTES: &[Route] = &[
     api(Get, "/arena/entrants/{id}/config-history"),
     api(Get, "/arena/entrants/{id}/transcript"),
     api(Post, "/arena/entrants/{id}/clone"),
-    // Charts: the only route whose upstream path differs.
-    Route {
-        verb: Get,
-        path: "/tokens/{mint}/candles",
-        upstream: Upstream::Indexer,
-        upstream_path: "/terminal/{mint}/candles",
-        limit: None,
-        timeout: None,
-        delivery: Delivery::Buffered,
-    },
     // Account settings
     api(Get, "/me/settings"),
     api(Put, "/me/settings"),
@@ -296,7 +277,6 @@ pub fn router(proxy: Proxy) -> Router {
     Router::new()
         .merge(limited(group(Limit::Platform), PLATFORM_CONCURRENCY))
         .merge(limited(group(Limit::Arena), ARENA_CONCURRENCY))
-        .merge(limited(group(Limit::Indexer), INDEXER_CONCURRENCY))
         .merge(limited(group(Limit::Trade), TRADE_CONCURRENCY))
         // The proxy limits these itself, for as long as each stream is open.
         .merge(group(Limit::Ai))
@@ -418,13 +398,6 @@ mod tests {
                 assert_eq!(route.limit(), Limit::Platform, "{}", route.path);
             }
         }
-        assert_eq!(
-            ROUTES
-                .iter()
-                .filter(|route| route.limit() == Limit::Indexer)
-                .count(),
-            1
-        );
     }
 
     /// The routes that move money, with their upstream timeouts. Each is a
@@ -587,17 +560,10 @@ mod tests {
     }
 
     #[test]
-    fn should_rename_only_the_candles_route() {
+    fn should_forward_every_route_to_the_platform_api_on_its_own_path() {
         for route in ROUTES {
-            if route.upstream == Upstream::Indexer {
-                assert_eq!(route.path, "/tokens/{mint}/candles");
-                assert_eq!(route.upstream_path, "/terminal/{mint}/candles");
-            } else {
-                assert_eq!(
-                    route.upstream_path, route.path,
-                    "platform API paths are kept"
-                );
-            }
+            assert_eq!(route.upstream, Upstream::Platform, "{}", route.path);
+            assert_eq!(route.upstream_path, route.path, "{}", route.path);
         }
     }
 
@@ -623,18 +589,14 @@ mod tests {
 
     #[test]
     fn should_fill_the_upstream_path_from_the_params() {
-        let candles = ROUTES
+        let funding = ROUTES
             .iter()
-            .find(|route| route.upstream == Upstream::Indexer)
+            .find(|route| route.path == "/bots/{id}/wallet/funding/{funding_id}")
             .expect("listed");
-        let mint = "So11111111111111111111111111111111111111112";
-        let path = format!("/tokens/{mint}/candles");
-        let params = candles.params(&path).expect("matches");
-        assert_eq!(
-            candles.upstream_path_for(&params),
-            Some(format!("/terminal/{mint}/candles"))
-        );
-        assert_eq!(candles.upstream_path_for(&[]), None);
+        let path = "/bots/abc/wallet/funding/f%2F1";
+        let params = funding.params(path).expect("matches");
+        assert_eq!(funding.upstream_path_for(&params), Some(path.to_owned()));
+        assert_eq!(funding.upstream_path_for(&[("id", "abc")]), None);
     }
 
     /// The static `/bots/...` routes must win over `/bots/{id}` in either

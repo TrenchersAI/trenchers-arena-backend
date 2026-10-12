@@ -1,5 +1,5 @@
 //! Backend for the Arena mobile app: an HTTP gateway that forwards
-//! the routes in [`routes::ROUTES`] to the platform API and the indexer API.
+//! the routes in [`routes::ROUTES`] to the platform API.
 
 pub mod config;
 pub mod error;

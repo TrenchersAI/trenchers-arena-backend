@@ -194,7 +194,7 @@ mod tests {
                 source: connection_refused().await,
             },
             GatewayError::UpstreamTimeout {
-                upstream: Upstream::Indexer,
+                upstream: Upstream::Platform,
                 source: connection_refused().await,
             },
             GatewayError::UpstreamTooLarge {
@@ -211,7 +211,7 @@ mod tests {
             assert_eq!(body["category"], "upstream");
             let message = body["error"].as_str().expect("message");
             assert!(
-                message.starts_with("platform-api ") || message.starts_with("indexer-api "),
+                message.starts_with("platform-api "),
                 "the message names the upstream: {message}"
             );
             assert!(

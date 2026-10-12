@@ -1,4 +1,4 @@
-//! Configuration from environment variables. The two service URLs are
+//! Configuration from environment variables. The platform API URL is
 //! required; the other settings have defaults.
 
 use std::net::IpAddr;
@@ -13,8 +13,6 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 15_000;
 pub struct Config {
     /// The platform API: auth, bots, arena, leaderboard.
     pub platform_api_url: Url,
-    /// The indexer API: token charts.
-    pub indexer_api_url: Url,
     pub port: u16,
     /// One upstream call, from connect until its whole body is read, unless
     /// the route sets a longer timeout. Also the limit for reading the
@@ -92,7 +90,6 @@ impl Config {
         };
         let required = |name: &'static str| var(name).ok_or(ConfigError::Missing { var: name });
         let platform_api_url = upstream_url("PLATFORM_API_URL", &required("PLATFORM_API_URL")?)?;
-        let indexer_api_url = upstream_url("INDEXER_API_URL", &required("INDEXER_API_URL")?)?;
         let port = match var("PORT") {
             None => DEFAULT_PORT,
             Some(raw) => raw
@@ -111,7 +108,6 @@ impl Config {
         };
         Ok(Self {
             platform_api_url,
-            indexer_api_url,
             port,
             upstream_timeout: Duration::from_millis(timeout_ms),
             streams: StreamLimits::default(),
@@ -158,16 +154,14 @@ mod tests {
     use super::*;
 
     const PLATFORM: &str = "https://platform.example.com";
-    const INDEXER: &str = "https://indexer.example.com";
 
-    /// Valid service URLs plus `vars`, which override them.
+    /// A valid platform API URL plus `vars`, which override it.
     fn config(vars: &[(&str, &str)]) -> Result<Config, ConfigError> {
-        let vars: HashMap<String, String> =
-            [("PLATFORM_API_URL", PLATFORM), ("INDEXER_API_URL", INDEXER)]
-                .iter()
-                .chain(vars)
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+        let vars: HashMap<String, String> = [("PLATFORM_API_URL", PLATFORM)]
+            .iter()
+            .chain(vars)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         Config::from_lookup(|name| vars.get(name).cloned())
     }
 
@@ -177,29 +171,24 @@ mod tests {
 
     #[test]
     fn should_default_port_and_timeout() {
-        let config = config(&[]).expect("service URLs are enough");
+        let config = config(&[]).expect("the platform API URL is enough");
         assert_eq!(
             config.platform_api_url.as_str(),
             "https://platform.example.com/"
-        );
-        assert_eq!(
-            config.indexer_api_url.as_str(),
-            "https://indexer.example.com/"
         );
         assert_eq!(config.port, 8080);
         assert_eq!(config.upstream_timeout, Duration::from_millis(15_000));
     }
 
     #[test]
-    fn should_require_both_service_urls() {
-        for var in ["PLATFORM_API_URL", "INDEXER_API_URL"] {
-            for missing in ["", "  "] {
-                assert_eq!(
-                    config(&[(var, missing)]).expect_err(var),
-                    ConfigError::Missing { var },
-                    "{var}={missing:?}"
-                );
-            }
+    fn should_require_the_platform_api_url() {
+        let var = "PLATFORM_API_URL";
+        for missing in ["", "  "] {
+            assert_eq!(
+                config(&[(var, missing)]).expect_err(var),
+                ConfigError::Missing { var },
+                "{var}={missing:?}"
+            );
         }
         let error = Config::from_lookup(|_| None).expect_err("nothing set");
         assert_eq!(
@@ -225,16 +214,11 @@ mod tests {
     fn should_accept_remote_and_local_upstreams() {
         let config = config(&[
             ("PLATFORM_API_URL", "https://api.example.net"),
-            ("INDEXER_API_URL", "https://charts.example.net/"),
             ("PORT", "3000"),
             ("UPSTREAM_TIMEOUT_MS", "2500"),
         ])
         .expect("custom values are valid");
         assert_eq!(config.platform_api_url.as_str(), "https://api.example.net/");
-        assert_eq!(
-            config.indexer_api_url.as_str(),
-            "https://charts.example.net/"
-        );
         assert_eq!(config.port, 3000);
         assert_eq!(config.upstream_timeout, Duration::from_millis(2500));
 

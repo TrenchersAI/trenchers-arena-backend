@@ -21,6 +21,7 @@ const ENTRANT: &str = "5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11";
 const MINT: &str = "So11111111111111111111111111111111111111112";
 const WALLET: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
 const ORDER: &str = "3c9e1f7a-8b2d-4e6f-a1c3-5d7e9f0b2a46";
+const FUNDING: &str = "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2f";
 const USER_AGENT: &str = concat!("trenchers-arena-backend/", env!("CARGO_PKG_VERSION"));
 
 const PRIVY_BODY: &str = r#"{"privy_token":"privy.token.value","wallet_address":"9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"}"#;
@@ -32,6 +33,16 @@ const SETTINGS_BODY: &str =
     r#"{"ui_prefs":{"tradingPresets":{"buy":[{"amount_sol":"0.1","slippage_bps":500}]}}}"#;
 const TOKENS_META_BODY: &str = r#"{"mints":["So11111111111111111111111111111111111111112","EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]}"#;
 const INSIGHT_BODY: &str = r#"{"message":"Give me a two-line briefing on this bot."}"#;
+const DELEGATED_BODY: &str = r#"{"wallet_id":"cm7x2k9pq00a1b2c3d4e5f6g7"}"#;
+const FUND_BODY: &str = r#"{"amount_lamports":250000000}"#;
+const WITHDRAW_BODY: &str = r#"{"amount_lamports":"all"}"#;
+const SWAP_BODY: &str = r#"{"input_mint":"So11111111111111111111111111111111111111112","output_mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":"100000000","side":"buy","slippage_bps":1000,"mev_mode":"off","mev_protect":false,"auto_fee":false,"idempotency_key":"6f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f"}"#;
+const SWAP_COMPLETE_BODY: &str = r#"{"intent_id":"8a7b6c5d-4e3f-4a2b-9c1d-0e9f8a7b6c5d","signature":"5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW","forwarded":false}"#;
+const SELL_INIT_QUOTE_BODY: &str =
+    r#"{"mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","market_cap_usd":"1250000"}"#;
+const ORDER_BODY: &str = r#"{"order_type":"limit","side":"buy","token_mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":"100000000","slippage_bps":500,"trigger_price":"0.000042"}"#;
+const SUBMIT_BODY: &str = r#"{"transaction":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}"#;
+const RPC_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[["5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW"],{"searchTransactionHistory":true}]}"#;
 const CLONE_KEY: &str = "clone-6a1f9c2e-entrant-5b0e8f0e";
 const CLONE_BODY: &str =
     r#"{"name":"My Opus copy","idempotency_key":"clone-6a1f9c2e-entrant-5b0e8f0e"}"#;
@@ -499,6 +510,95 @@ fn contract() -> Vec<Case> {
             "/bots/{id}/ai/insight/stream",
             format!("/bots/{BOT}/ai/insight/stream"),
             Some(INSIGHT_BODY),
+        ),
+        // Live agent wallets
+        api(
+            M::POST,
+            "/bots/live-confirm",
+            "/bots/live-confirm".into(),
+            Some("{}"),
+        ),
+        api(
+            M::POST,
+            "/bots/{id}/archive",
+            format!("/bots/{BOT}/archive"),
+            None,
+        ),
+        api(
+            M::GET,
+            "/bots/{id}/wallet",
+            format!("/bots/{BOT}/wallet"),
+            None,
+        ),
+        api(
+            M::POST,
+            "/bots/{id}/wallet",
+            format!("/bots/{BOT}/wallet"),
+            None,
+        ),
+        api(
+            M::POST,
+            "/bots/{id}/wallet/delegated",
+            format!("/bots/{BOT}/wallet/delegated"),
+            Some(DELEGATED_BODY),
+        ),
+        api(
+            M::POST,
+            "/bots/{id}/wallet/fund",
+            format!("/bots/{BOT}/wallet/fund"),
+            Some(FUND_BODY),
+        ),
+        api(
+            M::POST,
+            "/bots/{id}/wallet/withdraw",
+            format!("/bots/{BOT}/wallet/withdraw"),
+            Some(WITHDRAW_BODY),
+        ),
+        api(
+            M::GET,
+            "/bots/{id}/wallet/funding/{funding_id}",
+            format!("/bots/{BOT}/wallet/funding/{FUNDING}"),
+            None,
+        ),
+        // Trading
+        api(
+            M::POST,
+            "/trade/swap",
+            "/trade/swap".into(),
+            Some(SWAP_BODY),
+        ),
+        api(
+            M::POST,
+            "/trade/swap/prepare",
+            "/trade/swap/prepare".into(),
+            Some(SWAP_BODY),
+        ),
+        api(
+            M::POST,
+            "/trade/swap/complete",
+            "/trade/swap/complete".into(),
+            Some(SWAP_COMPLETE_BODY),
+        ),
+        api(
+            M::POST,
+            "/trade/sell-init/quote",
+            "/trade/sell-init/quote".into(),
+            Some(SELL_INIT_QUOTE_BODY),
+        ),
+        api(M::POST, "/orders", "/orders".into(), Some(ORDER_BODY)),
+        // Solana relay
+        api(
+            M::POST,
+            "/solana/submit",
+            "/solana/submit".into(),
+            Some(SUBMIT_BODY),
+        ),
+        api(M::POST, "/solana/rpc", "/solana/rpc".into(), Some(RPC_BODY)),
+        api(
+            M::GET,
+            "/solana/blockhash",
+            "/solana/blockhash".into(),
+            None,
         ),
     ]
 }
@@ -1302,7 +1402,6 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::POST, "/ai/chat".into()),
         (Method::GET, "/ai/chat".into()),
         (Method::GET, "/admin/settings".into()),
-        (Method::POST, "/trade/swap".into()),
         (Method::GET, "/metrics".into()),
         (Method::GET, "/health/live".into()),
         (Method::GET, "/ws".into()),
@@ -1316,7 +1415,6 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::POST, "/bots/import".into()),
         (Method::POST, "/bots/export".into()),
         (Method::POST, format!("/bots/{BOT}/withdraw")),
-        (Method::POST, format!("/bots/{BOT}/archive")),
         (Method::GET, format!("/bots/{BOT}/config-history")),
         (Method::GET, format!("/bots/{BOT}/auto-tune/transcript")),
         (Method::POST, format!("/bots/{BOT}/ai/chat/stream")),
@@ -1346,10 +1444,33 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::GET, "/admin/arena/seasons".into()),
         (Method::OPTIONS, "/bots".into()),
         (Method::POST, "/health".into()),
-        // Money and order writes stay closed for now.
-        (Method::POST, "/orders".into()),
+        // Money routes the app doesn't call stay closed, and so do other
+        // methods on the ones it does.
         (Method::POST, "/trade/buy".into()),
-        (Method::POST, format!("/bots/{BOT}/wallet")),
+        (Method::POST, "/trade/preview".into()),
+        (Method::POST, "/trade/quote".into()),
+        (Method::GET, "/trade/swap".into()),
+        (Method::POST, "/trade/swap/extra".into()),
+        (Method::PUT, "/orders".into()),
+        (Method::GET, "/bots/live-confirm".into()),
+        (Method::DELETE, format!("/bots/{BOT}/wallet")),
+        (Method::GET, format!("/bots/{BOT}/wallet/fund")),
+        (Method::POST, format!("/bots/{BOT}/wallet/sweep")),
+        (Method::POST, format!("/bots/{BOT}/wallet/migrate")),
+        (Method::GET, format!("/bots/{BOT}/wallet/locked-rent")),
+        (
+            Method::POST,
+            format!("/bots/{BOT}/wallet/locked-rent/claim"),
+        ),
+        (Method::GET, format!("/bots/{BOT}/wallet/funding")),
+        (
+            Method::POST,
+            format!("/bots/{BOT}/wallet/funding/{FUNDING}"),
+        ),
+        (Method::GET, "/solana/submit".into()),
+        (Method::POST, "/solana/blockhash".into()),
+        (Method::GET, "/solana/rpc".into()),
+        (Method::POST, "/solana".into()),
         // Neighbours of the account and portfolio reads that aren't listed.
         (Method::GET, format!("/orders/{ORDER}")),
         (Method::POST, "/me/settings".into()),
@@ -1466,6 +1587,18 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         (Method::GET, format!("/wallets/{BOT}/sol-balance")),
         (Method::GET, "/orders/not-a-uuid/events".into()),
         (Method::GET, format!("/orders/{MINT}/events")),
+        (Method::POST, "/bots/not-a-uuid/archive".into()),
+        (Method::GET, "/bots/not-a-uuid/wallet".into()),
+        (Method::POST, "/bots/not-a-uuid/wallet".into()),
+        (Method::POST, "/bots/not-a-uuid/wallet/delegated".into()),
+        (Method::POST, "/bots/not-a-uuid/wallet/fund".into()),
+        (Method::POST, format!("/bots/{MINT}/wallet/withdraw")),
+        (
+            Method::GET,
+            format!("/bots/not-a-uuid/wallet/funding/{FUNDING}"),
+        ),
+        // A near miss of `/bots/live-confirm` is a bot id.
+        (Method::POST, "/bots/live-confirm/archive".into()),
     ];
     for (method, path) in &cases {
         let response = gateway.send(method.clone(), path).await;
@@ -1495,6 +1628,8 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         format!("/bots/{BOT}%2F..%2F..%2Farena/arena-clone"),
         "/wallets/..%2F..%2Fadmin%2Fsettings/sol-balance".to_owned(),
         "/orders/%2e%2e/events".to_owned(),
+        format!("/bots/{BOT}/wallet/funding/%2e%2e"),
+        format!("/bots/{BOT}/wallet/funding/..%2F..%2Fwallet"),
     ];
     for target in &raw_targets {
         let (status, body) = raw_request(&gateway.base, &raw_get(target), b"").await;
@@ -1832,4 +1967,177 @@ async fn a_stalled_body_on_a_money_route_answers_408_after_the_default_timeout()
         started.elapsed()
     );
     gateway.assert_no_upstream_calls().await;
+}
+
+// ---------------------------------------------------------------------------
+// Live agent wallets, trading and the Solana relay
+// ---------------------------------------------------------------------------
+
+/// A server-signed swap carries its idempotency key in the body; the body and
+/// the caller's token reach the platform exactly as the app sent them.
+#[tokio::test]
+async fn a_swap_reaches_the_platform_with_body_and_token_intact() {
+    let gateway = Gateway::start().await;
+    let answer = r#"{"signature":"5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW","status":"submitted"}"#;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(answer, "application/json"))
+        .mount(&gateway.api)
+        .await;
+
+    let response = gateway
+        .http
+        .post(gateway.url("/trade/swap"))
+        .header("authorization", "Bearer session.jwt")
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body(SWAP_BODY)
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), answer);
+
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(received.len(), 1, "one call, never retried");
+    let got = &received[0];
+    assert_eq!(got.method, Method::POST);
+    assert_eq!(path_and_query(&got.url), "/trade/swap");
+    assert_eq!(got.body, SWAP_BODY.as_bytes());
+    assert_eq!(header(got, "authorization"), Some("Bearer session.jwt"));
+    assert_eq!(header(got, "content-type"), Some("application/json"));
+    assert_eq!(
+        header(got, "content-length"),
+        Some(&*SWAP_BODY.len().to_string())
+    );
+    assert!(gateway.received(Upstream::Indexer).await.is_empty());
+}
+
+/// With the default `UPSTREAM_TIMEOUT_MS` (15s), a swap the platform takes
+/// 20s to answer still comes back: its own timeout is 65s.
+#[tokio::test]
+async fn a_swap_slower_than_the_default_timeout_still_succeeds() {
+    let gateway = Gateway::start_with_timeout(Duration::from_secs(15)).await;
+    let answer = r#"{"signature":"","status":"submitted"}"#;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(answer, "application/json")
+                .set_delay(Duration::from_secs(20)),
+        )
+        .mount(&gateway.api)
+        .await;
+
+    let started = Instant::now();
+    let response = gateway
+        .http
+        .post(gateway.url("/trade/swap"))
+        .header("authorization", "Bearer session.jwt")
+        .header("content-type", "application/json")
+        .body(SWAP_BODY)
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), answer);
+    assert!(started.elapsed() >= Duration::from_secs(20));
+    assert_eq!(gateway.received(Upstream::Platform).await.len(), 1);
+}
+
+/// Every money route outlasts the default timeout, and the routes beside them
+/// that move no money don't. Same pattern as
+/// `a_money_route_outlasts_the_default_timeout`, sent concurrently.
+#[tokio::test]
+async fn every_money_route_outlasts_the_default_timeout() {
+    let gateway = Gateway::start_with_timeout(Duration::from_millis(200)).await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"ok":true}"#, "application/json")
+                .set_delay(Duration::from_secs(1)),
+        )
+        .mount(&gateway.api)
+        .await;
+    let money = [
+        (Method::POST, "/bots/{id}/wallet/fund"),
+        (Method::POST, "/bots/{id}/wallet/withdraw"),
+        (Method::POST, "/trade/swap"),
+        (Method::POST, "/trade/swap/prepare"),
+        (Method::POST, "/trade/swap/complete"),
+        (Method::POST, "/trade/sell-init/quote"),
+        (Method::POST, "/orders"),
+        (Method::POST, "/solana/submit"),
+    ];
+    let default = [
+        (Method::POST, "/bots/live-confirm"),
+        (Method::POST, "/bots/{id}/wallet/delegated"),
+        (Method::GET, "/bots/{id}/wallet/funding/{funding_id}"),
+        (Method::GET, "/orders"),
+        (Method::POST, "/solana/rpc"),
+        (Method::GET, "/solana/blockhash"),
+    ];
+    let calls: Vec<_> = contract()
+        .into_iter()
+        .filter_map(|case| {
+            let key = (case.method.clone(), case.pattern);
+            let expected = if money.contains(&key) {
+                StatusCode::OK
+            } else if default.contains(&key) {
+                StatusCode::BAD_GATEWAY
+            } else {
+                return None;
+            };
+            let label = format!("{} {}", case.method, case.pattern);
+            let send = gateway.request(&case).send();
+            Some(tokio::spawn(async move { (label, expected, send.await) }))
+        })
+        .collect();
+    assert_eq!(calls.len(), money.len() + default.len());
+    for call in calls {
+        let (label, expected, response) = call.await.expect("join");
+        let response = response.expect("the gateway answers");
+        assert_eq!(response.status(), expected, "{label}");
+    }
+}
+
+/// `{funding_id}` is checked as a UUID before anything is forwarded.
+#[tokio::test]
+async fn a_malformed_funding_id_answers_400_without_reaching_the_platform() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    for funding in [
+        "not-a-uuid",
+        "42",
+        MINT,
+        "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2",
+    ] {
+        let path = format!("/bots/{BOT}/wallet/funding/{funding}");
+        let response = gateway.send(Method::GET, &path).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let body = json(response).await;
+        assert_error_shape(&body, 400, "validation");
+        assert_eq!(
+            body["error"], "invalid path parameter `funding_id`: expected a UUID",
+            "{path}"
+        );
+    }
+    gateway.assert_no_upstream_calls().await;
+}
+
+/// The app reads the platform's 404 from `GET /bots/{id}/wallet` as "no wallet
+/// yet". It comes back as the platform sent it, not as the gateway's own 404.
+#[tokio::test]
+async fn a_missing_bot_wallet_404_passes_through_unchanged() {
+    let gateway = Gateway::start().await;
+    let body =
+        format!(r#"{{"error":"bot wallet not found: {BOT}","code":404,"category":"not_found"}}"#);
+    Mock::given(wiremock::matchers::path(format!("/bots/{BOT}/wallet")))
+        .respond_with(ResponseTemplate::new(404).set_body_raw(body.clone(), "application/json"))
+        .mount(&gateway.api)
+        .await;
+
+    let response = gateway
+        .send(Method::GET, &format!("/bots/{BOT}/wallet"))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.expect("body"), body);
+    assert_eq!(gateway.received(Upstream::Platform).await.len(), 1);
 }

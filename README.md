@@ -10,9 +10,9 @@ Arena app
    v
 trenchers-arena-backend  (this repo)
    |
-   |-- auth, bots, arena ----> platform API  (PLATFORM_API_URL)
+   |-- auth, bots, arena, trading --> platform API  (PLATFORM_API_URL)
    |
-   '-- token charts ---------> indexer API   (INDEXER_API_URL)
+   '-- token charts ----------------> indexer API   (INDEXER_API_URL)
 ```
 
 What the gateway does on every request:
@@ -89,13 +89,48 @@ Platform API routes keep their path. The only renamed route is the chart route.
 | POST | `/public/tokens-meta` | platform | |
 | DELETE | `/orders/{id}` | platform (money route, 35s) | `id`: UUID |
 | POST | `/bots/{id}/ai/insight/stream` | platform (streamed, see [Streaming](#streaming)) | `id`: UUID |
+| POST | `/bots/live-confirm` | platform | |
+| POST | `/bots/{id}/archive` | platform | `id`: UUID |
+| GET | `/bots/{id}/wallet` | platform | `id`: UUID |
+| POST | `/bots/{id}/wallet` | platform | `id`: UUID |
+| POST | `/bots/{id}/wallet/delegated` | platform | `id`: UUID |
+| POST | `/bots/{id}/wallet/fund` | platform (money route, 20s) | `id`: UUID |
+| POST | `/bots/{id}/wallet/withdraw` | platform (money route, 20s) | `id`: UUID |
+| GET | `/bots/{id}/wallet/funding/{funding_id}` | platform | `id`, `funding_id`: UUID |
+| POST | `/trade/swap` | platform (money route, 65s) | |
+| POST | `/trade/swap/prepare` | platform (money route, 35s) | |
+| POST | `/trade/swap/complete` | platform (money route, 35s) | |
+| POST | `/trade/sell-init/quote` | platform (money route, 35s) | |
+| POST | `/orders` | platform (money route, 65s) | |
+| POST | `/solana/submit` | platform (money route, 35s) | |
+| POST | `/solana/rpc` | platform | |
+| GET | `/solana/blockhash` | platform | |
 
 `/fees/recommendation`, `/wallets/{address}/sol-balance` and `/public/tokens-meta` take
 no token on the platform; the others need one. `/public/tokens-meta` takes a JSON body
 `{ "mints": [...] }` (at most 100) and shares one rate limit across all app users (see
-[Known limit](#known-limit-per-ip-rate-limits-are-shared)). `DELETE /orders/{id}` is the
-first money route (see [Money routes](#money-routes)); the others (`/trade/*`,
-`POST /orders`, `/solana/*`, bot wallet actions) are not forwarded yet.
+[Known limit](#known-limit-per-ip-rate-limits-are-shared)). The swaps, orders, bot wallet
+transfers and `/solana/submit` are money routes (see [Money routes](#money-routes)).
+Other platform trading and bot wallet routes (`/trade/preview`, `/trade/quote`, the
+wallet sweep, migrate and locked-rent routes, `POST /bots/{id}/withdraw`) are not
+forwarded.
+
+Live agents, briefly (the platform does the checks; the gateway only passes them on):
+
+- **Wallet reads.** `GET /bots/{id}/wallet` answers `404` before the bot has a wallet,
+  and the app reads that as "no wallet yet". It is the platform's 404, passed through;
+  the gateway's own 404 (`category: validation`) means the route isn't listed.
+- **Funding.** `fund` and `withdraw` are server-signed transfers between the Trenchers
+  wallet and the bot wallet, with `{ "amount_lamports": <int> }` (`"all"` on a
+  withdraw). They carry no idempotency key. `GET /bots/{id}/wallet/funding/{funding_id}`
+  reads one transfer, owner-scoped (404 otherwise).
+- **Swaps.** The app tries a client-signed swap first (`/trade/swap/prepare`, sign,
+  `/solana/submit`, `/trade/swap/complete`). The platform answers `prepare` with `404`
+  unless `ST_CLIENT_SIGNING` is on in that environment, and the app then falls back to
+  the server-signed `POST /trade/swap`, whose idempotency key is the `idempotency_key`
+  field in the body.
+- **Solana relay.** `/solana/rpc` takes a JSON-RPC body; the platform allowlists the
+  methods. `/solana/submit` takes `{ "transaction": <base64> }`.
 
 ### Money routes
 
@@ -111,15 +146,13 @@ in `src/routes.rs`. Each one gets:
 
 | Route | Gateway timeout | App timeout |
 |-------|-----------------|-------------|
-| `DELETE /orders/{id}` | 35s | 30s |
-
-Planned for the next money routes (same rule, app timeout + 5s):
-
-| Route | Gateway timeout | App timeout |
-|-------|-----------------|-------------|
 | `POST /trade/swap`, `POST /orders` | 65s | 60s |
-| `POST /trade/swap/prepare`, `/trade/swap/complete`, `/trade/sell-init/quote`, `POST /solana/submit` | 35s | 30s |
+| `DELETE /orders/{id}`, `POST /trade/swap/prepare`, `/trade/swap/complete`, `/trade/sell-init/quote`, `POST /solana/submit` | 35s | 30s |
 | `POST /bots/{id}/wallet/fund`, `/bots/{id}/wallet/withdraw` | 20s | 15s (the app's default) |
+
+`/trade/sell-init/quote` moves no money (the platform treats it as a read) but sits in
+the money group for its longer timeout. `/solana/rpc` and `/solana/blockhash` stay in
+the platform group on the default timeout.
 
 When a money route times out the app gets the gateway's
 `502 {"error":"platform-api did not answer in time","code":502,"category":"upstream"}`,
@@ -218,8 +251,10 @@ Some patterns share a prefix: `/bots/stats` (and the other static `/bots/...` re
 including `/bots/wallets`) and `/bots/{id}`, `/arena/seasons` and
 `/arena/seasons/{number}`, `/arena/entrants/{id}` and its tabs,
 `/bots/{id}/arena-clone` next to the other `/bots/{id}/...` routes, and
-`DELETE /orders/{id}` next to `GET /orders/{id}/events`, and
-`/bots/{id}/ai/insight/stream` under `/bots/{id}`. axum matches whole
+`DELETE /orders/{id}` next to `GET /orders/{id}/events`,
+`/bots/{id}/ai/insight/stream` under `/bots/{id}`, `/bots/live-confirm` and
+`/bots/{id}`, and the `/bots/{id}/wallet/...` routes (`fund` next to
+`funding/{funding_id}`). axum matches whole
 segments and prefers a static segment over a `{param}`, whatever the order in
 `ROUTES`. The `route_precedence_tests` module in `src/routes.rs` checks this in both
 registration orders.

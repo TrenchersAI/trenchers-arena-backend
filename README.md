@@ -1,8 +1,7 @@
 # trenchers-arena-backend
 
 Backend for the Trenchers Arena mobile app. It is a small HTTP gateway (Rust, axum)
-that forwards an allowlist of routes to two upstream services and refuses everything
-else:
+that forwards an allowlist of routes to the platform API and refuses everything else:
 
 ```text
 Arena app
@@ -10,10 +9,12 @@ Arena app
    v
 trenchers-arena-backend  (this repo)
    |
-   |-- auth, bots, arena, trading --> platform API  (PLATFORM_API_URL)
-   |
-   '-- token charts ----------------> indexer API   (INDEXER_API_URL)
+   '-- auth, bots, arena, trading --> platform API  (PLATFORM_API_URL)
 ```
+
+Market data (charts, the pulse feed and the WebSockets) does not go through the gateway;
+the app calls those services directly (see
+[Pointing the mobile app at the gateway](#pointing-the-mobile-app-at-the-gateway)).
 
 What the gateway does on every request:
 
@@ -22,15 +23,13 @@ What the gateway does on every request:
 2. Check each path parameter (`src/validate.rs`). A bad one: a JSON 400, and nothing is
    sent upstream.
 3. Forward the request: same method, path and query string, the request body, and only
-   the `Content-Type`, `Accept` and `Idempotency-Key` headers, plus `Authorization` for
-   the platform API. The indexer never reads a session token, so it never gets one.
+   the `Authorization`, `Content-Type`, `Accept` and `Idempotency-Key` headers.
 4. Return the upstream status and body unchanged, with only `Content-Type`,
    `Cache-Control` and `Retry-After` copied back. The one streamed route passes its
    events back as they arrive (see [Streaming](#streaming)).
 
 Each group of routes has its own limit on in-flight requests (`src/routes.rs`): 64 for
-the platform API, 32 for the Arena routes, 32 for charts and 16 for the routes that move
-money. A request over its group's limit waits. The app polls the Arena routes, so slow
+the platform API, 32 for the Arena routes and 16 for the routes that move money. A request over its group's limit waits. The app polls the Arena routes, so slow
 Arena reads fill only their own limit and never make a sign-in or a bot action wait. The
 app's polling (fleet stats every 30s) sits in the platform group, so it never makes a
 swap or an order wait either. The platform's own money group allows 10 in flight and
@@ -51,7 +50,7 @@ Errors the gateway produces itself use the platform API's error body:
 
 ## Routes
 
-Platform API routes keep their path. The only renamed route is the chart route.
+Every route goes to the platform API on the same path.
 
 | Method | Path | Upstream | Path params |
 |--------|------|----------|-------------|
@@ -74,7 +73,6 @@ Platform API routes keep their path. The only renamed route is the chart route.
 | GET | `/bots/{id}/positions` | platform | `id`: UUID |
 | GET | `/bots/{id}/trades` | platform | `id`: UUID |
 | GET | `/bots/{id}/watching` | platform | `id`: UUID |
-| GET | `/tokens/{mint}/candles` | indexer, as `/terminal/{mint}/candles` | `mint`: base58 address |
 | GET | `/me/settings` | platform | |
 | PUT | `/me/settings` | platform | |
 | GET | `/portfolio` | platform | |
@@ -278,12 +276,11 @@ Read from environment variables only (`src/config.rs`). See `.env.example`.
 | Variable | Required | Default | Meaning |
 |----------|----------|---------|---------|
 | `PLATFORM_API_URL` | yes | | Platform API origin, `https://host[:port]`. Plain `http` only for localhost. |
-| `INDEXER_API_URL` | yes | | Indexer API origin, same rules. |
 | `PORT` | no | `8080` | Port to listen on. The gateway always binds all interfaces (`0.0.0.0`). |
 | `UPSTREAM_TIMEOUT_MS` | no | `15000` | Used twice: as the limit for reading the client's request body on every route (on expiry: 408), and separately as the default limit for one upstream call, including its response body (on expiry: 502). Money routes set a longer upstream timeout (see Money routes), and this value is their floor. A slow body followed by a slow upstream can take the two limits added up. |
 | `RUST_LOG` | no | `info` | Log filter. |
 
-The URLs must be bare origins: no path, query, fragment or credentials. Do not commit
+The URL must be a bare origin: no path, query, fragment or credentials. Do not commit
 real service URLs; keep them in `.env` (git-ignored) or the host's settings.
 
 ## Known limit: per-IP rate limits are shared
@@ -315,7 +312,7 @@ groups, not for a public launch.
 ## Running locally
 
 ```sh
-cp .env.example .env              # fill in PLATFORM_API_URL and INDEXER_API_URL
+cp .env.example .env              # fill in PLATFORM_API_URL
 set -a && . ./.env && set +a
 cargo run
 curl -s http://localhost:8080/health
@@ -341,6 +338,13 @@ EXPO_PUBLIC_API_BASE_URL=https://<gateway host>
 
 The app then calls `https://<gateway host>/arena/season`, `/auth/privy` and so on, and
 the gateway forwards them.
+
+Market data stays off the gateway. `EXPO_PUBLIC_PULSE_HTTP_URL` (pulse, terminal data
+including candles, token images) points straight at the indexer, and `EXPO_PUBLIC_WS_URL`
+and `EXPO_PUBLIC_PULSE_WS_URL` straight at st-ws-server. Leave them as they are: those
+services rate-limit by the real client IP (`CF-Connecting-IP`), and a gateway in between
+would put every app user in one bucket (see
+[Known limit](#known-limit-per-ip-rate-limits-are-shared)).
 
 Two rules from the app's code shape local testing:
 
@@ -395,8 +399,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
-`tests/gateway.rs` runs the gateway on a local port in front of two
-[wiremock](https://docs.rs/wiremock) servers and checks what each one receives.
+`tests/gateway.rs` runs the gateway on a local port in front of a
+[wiremock](https://docs.rs/wiremock) server and checks what it receives.
 `tests/streaming.rs` puts a small axum upstream behind it instead, which feeds an event
 stream chunk by chunk, to test streaming, its timeouts, the AI limit and cancellation. CI
 (`.github/workflows/ci.yml`) runs the three commands above and a Docker build on every

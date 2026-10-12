@@ -11,8 +11,7 @@ pub fn path_param(name: &'static str, raw: &str) -> Result<(), GatewayError> {
     let (valid, expected) = match name {
         "id" => (is_uuid(raw), "a UUID"),
         "funding_id" => (is_uuid(raw), "a UUID"),
-        "mint" => (is_mint(raw), "a base58 Solana address"),
-        "address" => (is_mint(raw), "a base58 Solana address"),
+        "address" => (is_base58_address(raw), "a base58 Solana address"),
         "number" => (is_season_number(raw), "a season number"),
         _ => (false, "a known parameter"),
     };
@@ -25,7 +24,7 @@ pub fn path_param(name: &'static str, raw: &str) -> Result<(), GatewayError> {
 
 /// Whether `name` has a check in [`path_param`].
 pub fn is_known(name: &str) -> bool {
-    matches!(name, "id" | "funding_id" | "mint" | "number" | "address")
+    matches!(name, "id" | "funding_id" | "number" | "address")
 }
 
 /// Bot, entrant, order and bot wallet funding ids, in any form the `uuid`
@@ -35,8 +34,7 @@ pub fn is_uuid(raw: &str) -> bool {
 }
 
 /// A Solana address: 32 to 44 base58 characters that decode to a 32-byte key.
-/// Token mints and wallet addresses are both checked with it.
-pub fn is_mint(raw: &str) -> bool {
+pub fn is_base58_address(raw: &str) -> bool {
     (32..=44).contains(&raw.len())
         && matches!(bs58::decode(raw).into_vec(), Ok(bytes) if bytes.len() == 32)
 }
@@ -81,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn should_accept_real_mints() {
+    fn should_accept_real_addresses() {
         for raw in [
             // Wrapped SOL, USDC, a pump.fun launch, the system program.
             "So11111111111111111111111111111111111111112",
@@ -89,7 +87,7 @@ mod tests {
             "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
             "11111111111111111111111111111111",
         ] {
-            assert!(is_mint(raw), "{raw}");
+            assert!(is_base58_address(raw), "{raw}");
         }
     }
 
@@ -110,7 +108,7 @@ mod tests {
             "So11111111111111111111111111111111111111112xy",
             "..",
         ] {
-            assert!(!is_mint(raw), "{raw:?}");
+            assert!(!is_base58_address(raw), "{raw:?}");
         }
     }
 
@@ -132,6 +130,8 @@ mod tests {
             GatewayError::InvalidPathParam { name: "wallet", .. }
         ));
         assert!(!is_known("wallet"));
+        assert!(path_param("mint", "So11111111111111111111111111111111111111112").is_err());
+        assert!(!is_known("mint"));
     }
 
     #[test]
@@ -171,8 +171,6 @@ mod tests {
     fn should_check_each_known_parameter_with_its_own_rule() {
         assert!(path_param("id", "1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10").is_ok());
         assert!(path_param("id", "So11111111111111111111111111111111111111112").is_err());
-        assert!(path_param("mint", "So11111111111111111111111111111111111111112").is_ok());
-        assert!(path_param("mint", "1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10").is_err());
         assert!(path_param("number", "6").is_ok());
         assert!(path_param("number", "1b4b1a48").is_err());
         assert!(path_param("address", "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").is_ok());
@@ -181,7 +179,7 @@ mod tests {
         assert!(path_param("address", "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl").is_err());
         assert!(path_param("address", "..").is_err());
         assert!(path_param("address", &"1".repeat(44)).is_err());
-        for name in ["id", "funding_id", "mint", "number", "address"] {
+        for name in ["id", "funding_id", "number", "address"] {
             assert!(is_known(name), "{name}");
         }
     }

@@ -1,5 +1,5 @@
-//! Integration tests: the gateway on a local port in front of two wiremock
-//! servers (platform API and indexer), checking what each one receives.
+//! Integration tests: the gateway on a local port in front of a wiremock
+//! server standing in for the platform API, checking what it receives.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -59,7 +59,6 @@ const FEED_CURSOR: &str =
 struct Gateway {
     base: String,
     api: MockServer,
-    indexer: MockServer,
     http: reqwest::Client,
 }
 
@@ -70,27 +69,23 @@ impl Gateway {
 
     async fn start_with_timeout(timeout: Duration) -> Self {
         let api = MockServer::start().await;
-        let indexer = MockServer::start().await;
-        let base = serve(&api.uri(), &indexer.uri(), timeout).await;
+        let base = serve(&api.uri(), timeout).await;
         Self {
             base,
             api,
-            indexer,
             http: test_client(),
         }
     }
 
-    /// Both upstreams answer every request with `200 {"ok":true}`.
-    async fn with_ok_upstreams() -> Self {
+    /// The platform API answers every request with `200 {"ok":true}`.
+    async fn with_ok_upstream() -> Self {
         let gateway = Self::start().await;
-        for server in [&gateway.api, &gateway.indexer] {
-            Mock::given(any())
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"),
-                )
-                .mount(server)
-                .await;
-        }
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"),
+            )
+            .mount(&gateway.api)
+            .await;
         gateway
     }
 
@@ -118,37 +113,31 @@ impl Gateway {
         }
     }
 
-    async fn received(&self, upstream: Upstream) -> Vec<Request> {
-        let server = match upstream {
-            Upstream::Platform => &self.api,
-            Upstream::Indexer => &self.indexer,
-        };
-        server
+    /// What the platform API has received so far.
+    async fn received(&self) -> Vec<Request> {
+        self.api
             .received_requests()
             .await
             .expect("request recording is on")
     }
 
     async fn assert_no_upstream_calls(&self) {
-        for upstream in [Upstream::Platform, Upstream::Indexer] {
-            let received = self.received(upstream).await;
-            assert!(
-                received.is_empty(),
-                "{upstream} must not be called, but received: {:?}",
-                received
-                    .iter()
-                    .map(|r| format!("{} {}", r.method, r.url))
-                    .collect::<Vec<_>>()
-            );
-        }
+        let received = self.received().await;
+        assert!(
+            received.is_empty(),
+            "the platform API must not be called, but received: {:?}",
+            received
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.url))
+                .collect::<Vec<_>>()
+        );
     }
 }
 
 /// Serves the gateway on an ephemeral port and returns its base URL.
-async fn serve(api: &str, indexer: &str, timeout: Duration) -> String {
+async fn serve(api: &str, timeout: Duration) -> String {
     let vars = HashMap::from([
         ("PLATFORM_API_URL", api.to_owned()),
-        ("INDEXER_API_URL", indexer.to_owned()),
         ("UPSTREAM_TIMEOUT_MS", timeout.as_millis().to_string()),
     ]);
     let config = Config::from_lookup(|name| vars.get(name).cloned()).expect("test config is valid");
@@ -436,15 +425,6 @@ fn contract() -> Vec<Case> {
             format!("/arena/entrants/{ENTRANT}/clone"),
             Some(CLONE_BODY),
         ),
-        // Indexer: the one renamed route.
-        Case {
-            method: M::GET,
-            pattern: "/tokens/{mint}/candles",
-            path: format!("/tokens/{MINT}/candles?res=15&from=1759600000&to=1759686400"),
-            body: None,
-            upstream: Upstream::Indexer,
-            upstream_path: format!("/terminal/{MINT}/candles?res=15&from=1759600000&to=1759686400"),
-        },
         // Account settings
         api(M::GET, "/me/settings", "/me/settings".into(), None),
         api(
@@ -620,11 +600,10 @@ fn the_contract_covers_every_allowlisted_route_and_nothing_else() {
 
 #[tokio::test]
 async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     for case in contract() {
         let label = format!("{} {}", case.method, case.path);
-        let api_before = gateway.received(Upstream::Platform).await.len();
-        let indexer_before = gateway.received(Upstream::Indexer).await.len();
+        let before = gateway.received().await.len();
 
         let mut request = gateway
             .http
@@ -644,19 +623,14 @@ async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact
             "{label}"
         );
 
-        let api = gateway.received(Upstream::Platform).await;
-        let indexer = gateway.received(Upstream::Indexer).await;
-        let (hit, missed) = match case.upstream {
-            Upstream::Platform => (&api[api_before..], &indexer[indexer_before..]),
-            Upstream::Indexer => (&indexer[indexer_before..], &api[api_before..]),
-        };
+        let received = gateway.received().await;
+        let hit = &received[before..];
         assert_eq!(
             hit.len(),
             1,
             "{label}: exactly one call to {}",
             case.upstream
         );
-        assert!(missed.is_empty(), "{label}: no call to the other upstream");
         let got = &hit[0];
         assert_eq!(got.method, case.method, "{label}: method");
         assert_eq!(
@@ -669,14 +643,9 @@ async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact
             case.body.unwrap_or_default().as_bytes(),
             "{label}: body"
         );
-        // The indexer never reads a session token, so it never gets one.
-        let authorization = match case.upstream {
-            Upstream::Platform => Some("Bearer session.jwt"),
-            Upstream::Indexer => None,
-        };
         assert_eq!(
             header(got, "authorization"),
-            authorization,
+            Some("Bearer session.jwt"),
             "{label}: authorization"
         );
     }
@@ -688,7 +657,7 @@ async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact
 
 #[tokio::test]
 async fn only_allowlisted_request_headers_reach_the_upstream() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let response = gateway
         .http
         .post(gateway.url(&format!("/bots/{BOT}/allocate")))
@@ -729,7 +698,7 @@ async fn only_allowlisted_request_headers_reach_the_upstream() {
         .expect("the gateway answers");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     let got = &received[0];
     assert_eq!(
         header(got, "authorization"),
@@ -760,7 +729,7 @@ async fn only_allowlisted_request_headers_reach_the_upstream() {
 
 #[tokio::test]
 async fn a_request_without_authorization_is_forwarded_without_one() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let response = gateway
         .http
         .post(gateway.url("/auth/refresh"))
@@ -770,7 +739,7 @@ async fn a_request_without_authorization_is_forwarded_without_one() {
         .await
         .expect("the gateway answers");
     assert_eq!(response.status(), StatusCode::OK);
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(header(&received[0], "authorization"), None);
     assert_eq!(received[0].body, REFRESH_BODY.as_bytes());
 }
@@ -779,7 +748,7 @@ async fn a_request_without_authorization_is_forwarded_without_one() {
 /// `Content-Length: 0`, as OkHttp sends it.
 #[tokio::test]
 async fn an_order_cancel_is_forwarded_as_an_empty_delete() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let response = gateway
         .http
         .delete(gateway.url(&format!("/orders/{ORDER}")))
@@ -788,7 +757,7 @@ async fn an_order_cancel_is_forwarded_as_an_empty_delete() {
         .await
         .expect("the gateway answers");
     assert_eq!(response.status(), StatusCode::OK);
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(received.len(), 1);
     let got = &received[0];
     assert_eq!(got.method, Method::DELETE);
@@ -801,7 +770,7 @@ async fn an_order_cancel_is_forwarded_as_an_empty_delete() {
 
 #[tokio::test]
 async fn a_bodiless_action_is_forwarded_as_an_empty_post() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let response = gateway
         .http
         .post(gateway.url(&format!("/bots/{BOT}/pause")))
@@ -810,7 +779,7 @@ async fn a_bodiless_action_is_forwarded_as_an_empty_post() {
         .await
         .expect("the gateway answers");
     assert_eq!(response.status(), StatusCode::OK);
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     let got = &received[0];
     assert_eq!(got.method, Method::POST);
     assert!(got.body.is_empty());
@@ -893,7 +862,7 @@ async fn only_allowlisted_response_headers_come_back_from_the_upstream() {
                 .insert_header("retry-after", "5")
                 .insert_header("idempotent-replayed", "true")
                 .insert_header("set-cookie", "upstream=1; Secure")
-                .insert_header("link", "</terminal/x/candles>; rel=\"canonical\"")
+                .insert_header("link", "</arena/feed>; rel=\"canonical\"")
                 .insert_header("x-powered-by", "upstream")
                 .insert_header("access-control-allow-origin", "*")
                 .insert_header("strict-transport-security", "max-age=31536000")
@@ -922,26 +891,6 @@ async fn only_allowlisted_response_headers_come_back_from_the_upstream() {
         "upstream headers that must not reach the app: {:?}",
         names.difference(&allowed).collect::<Vec<_>>()
     );
-}
-
-#[tokio::test]
-async fn indexer_refusals_pass_through_as_plain_text() {
-    let gateway = Gateway::start().await;
-    Mock::given(any())
-        .respond_with(
-            ResponseTemplate::new(400).set_body_raw("invalid res", "text/plain; charset=utf-8"),
-        )
-        .mount(&gateway.indexer)
-        .await;
-    let response = gateway
-        .send(Method::GET, &format!("/tokens/{MINT}/candles?res=7"))
-        .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.headers()["content-type"],
-        "text/plain; charset=utf-8"
-    );
-    assert_eq!(response.text().await.expect("body"), "invalid res");
 }
 
 #[tokio::test]
@@ -985,7 +934,7 @@ async fn upstream_redirects_are_returned_not_followed() {
     Mock::given(any())
         .respond_with(
             ResponseTemplate::new(302)
-                .insert_header("location", format!("{}/elsewhere", gateway.indexer.uri())),
+                .insert_header("location", format!("{}/elsewhere", gateway.api.uri())),
         )
         .mount(&gateway.api)
         .await;
@@ -998,8 +947,9 @@ async fn upstream_redirects_are_returned_not_followed() {
         .expect("the gateway answers");
     assert_eq!(response.status(), StatusCode::FOUND);
     assert!(response.headers().get("location").is_none());
-    assert!(
-        gateway.received(Upstream::Indexer).await.is_empty(),
+    assert_eq!(
+        gateway.received().await.len(),
+        1,
         "a redirect target must never receive the caller's request"
     );
 }
@@ -1040,7 +990,7 @@ fn the_contract_lists_all_thirteen_arena_routes() {
 
 #[tokio::test]
 async fn public_arena_routes_are_forwarded_without_a_token() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let public = [
         "/arena/paper-bots".to_owned(),
         "/arena/season".to_owned(),
@@ -1054,7 +1004,7 @@ async fn public_arena_routes_are_forwarded_without_a_token() {
         let response = gateway.send(Method::GET, path).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     let paths: Vec<String> = received
         .iter()
         .map(|request| path_and_query(&request.url))
@@ -1090,7 +1040,7 @@ async fn signed_in_arena_routes_leave_the_401_to_the_platform() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{label}");
         assert_eq!(response.text().await.expect("body"), body, "{label}");
     }
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(received.len(), signed_in.len());
     for request in &received {
         assert_eq!(header(request, "authorization"), None, "{}", request.url);
@@ -1128,7 +1078,7 @@ async fn a_closed_arena_gate_404_passes_through_unchanged() {
                 "{label}"
             );
             assert_eq!(response.text().await.expect("body"), body, "{label}");
-            let received = gateway.received(Upstream::Platform).await;
+            let received = gateway.received().await;
             assert_eq!(received.len(), 1, "{label}: forwarded once");
             assert_eq!(header(&received[0], "authorization"), token, "{label}");
         }
@@ -1175,7 +1125,7 @@ async fn a_clone_and_its_retry_reach_the_platform_with_body_and_idempotency_key_
     }
     assert_eq!(answers, [CLONE_RESPONSE, CLONE_RESPONSE]);
 
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(
         received.len(),
         2,
@@ -1246,7 +1196,7 @@ async fn clone_refusals_pass_through_unchanged() {
 /// gateway forwards the query as sent and leaves those decisions to it.
 #[tokio::test]
 async fn arena_query_strings_are_forwarded_without_clamping_or_checks() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let paths = [
         format!("/arena/entrants/{ENTRANT}/trades?limit=0"),
         format!("/arena/entrants/{ENTRANT}/trades?limit=9999"),
@@ -1266,7 +1216,7 @@ async fn arena_query_strings_are_forwarded_without_clamping_or_checks() {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
     let received: Vec<String> = gateway
-        .received(Upstream::Platform)
+        .received()
         .await
         .iter()
         .map(|request| path_and_query(&request.url))
@@ -1347,7 +1297,7 @@ async fn a_settings_save_reaches_the_platform_with_query_body_and_token_intact()
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.text().await.expect("body"), r#"{"ok":true}"#);
 
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(received.len(), 1);
     let got = &received[0];
     assert_eq!(got.method, Method::PUT);
@@ -1355,14 +1305,13 @@ async fn a_settings_save_reaches_the_platform_with_query_body_and_token_intact()
     assert_eq!(got.body, SETTINGS_BODY.as_bytes());
     assert_eq!(header(got, "content-type"), Some("application/json"));
     assert_eq!(header(got, "authorization"), Some("Bearer session.jwt"));
-    assert!(gateway.received(Upstream::Indexer).await.is_empty());
 }
 
 /// Token metadata and wallet SOL balances take no token on the platform, and
 /// the gateway forwards them without one.
 #[tokio::test]
 async fn public_token_meta_and_sol_balance_are_forwarded_without_a_token() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let response = gateway
         .http
         .post(gateway.url("/public/tokens-meta"))
@@ -1377,7 +1326,7 @@ async fn public_token_meta_and_sol_balance_are_forwarded_without_a_token() {
     let response = gateway.send(Method::GET, &balance).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(received.len(), 2);
     assert_eq!(received[0].method, Method::POST);
     assert_eq!(path_and_query(&received[0].url), "/public/tokens-meta");
@@ -1395,7 +1344,7 @@ async fn public_token_meta_and_sol_balance_are_forwarded_without_a_token() {
 
 #[tokio::test]
 async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let cases: Vec<(Method, String)> = vec![
         (Method::POST, "/admin/jobs/run".into()),
         (Method::GET, "/admin/jobs/run".into()),
@@ -1408,7 +1357,9 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::GET, "/".into()),
         (Method::GET, "/bots/".into()),
         (Method::GET, "/BOTS".into()),
-        // The indexer is reachable only through the renamed candles route.
+        // Market data: the app fetches it directly, never through the gateway.
+        (Method::GET, format!("/tokens/{MINT}/candles")),
+        (Method::GET, format!("/tokens/{MINT}/candles?res=15")),
         (Method::GET, format!("/terminal/{MINT}/candles")),
         (Method::GET, format!("/tokens/{MINT}/trades")),
         // Platform API routes that aren't allowlisted.
@@ -1493,7 +1444,7 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
 
 #[tokio::test]
 async fn static_bot_segments_are_never_captured_as_a_bot_id() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let statics = [
         format!("/bots/stats?ids={BOT},{OTHER_BOT}"),
         "/bots/leaderboard".to_owned(),
@@ -1509,7 +1460,7 @@ async fn static_bot_segments_are_never_captured_as_a_bot_id() {
         );
     }
     let received: Vec<String> = gateway
-        .received(Upstream::Platform)
+        .received()
         .await
         .iter()
         .map(|request| path_and_query(&request.url))
@@ -1527,15 +1478,12 @@ async fn static_bot_segments_are_never_captured_as_a_bot_id() {
         let response = gateway.send(Method::GET, path).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
-    assert_eq!(
-        gateway.received(Upstream::Platform).await.len(),
-        statics.len()
-    );
+    assert_eq!(gateway.received().await.len(), statics.len());
 }
 
 #[tokio::test]
 async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let cases: Vec<(Method, String)> = vec![
         (Method::GET, "/bots/not-a-uuid".into()),
         (
@@ -1576,12 +1524,14 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         // Not base58 (0, O, I and l are outside the alphabet).
         (
             Method::GET,
-            "/tokens/0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl/candles".into(),
+            "/wallets/0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl/sol-balance".into(),
         ),
-        (Method::GET, "/tokens/short/candles".into()),
-        (Method::GET, format!("/tokens/{MINT}xy/candles")),
+        (Method::GET, "/wallets/short/sol-balance".into()),
         // 44 base58 characters that decode to 44 bytes, not a 32-byte key.
-        (Method::GET, format!("/tokens/{}/candles", "1".repeat(44))),
+        (
+            Method::GET,
+            format!("/wallets/{}/sol-balance", "1".repeat(44)),
+        ),
         (Method::GET, "/wallets/not-an-address/sol-balance".into()),
         (Method::GET, format!("/wallets/{WALLET}xy/sol-balance")),
         (Method::GET, format!("/wallets/{BOT}/sol-balance")),
@@ -1619,7 +1569,6 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         "/bots/%2e%2e/stats".to_owned(),
         format!("/bots/{BOT}%2F..%2F..%2Fadmin"),
         format!("/bots/{BOT}%20"),
-        "/tokens/..%2F..%2Fadmin%2Fsettings/candles".to_owned(),
         "/arena/seasons/%36".to_owned(),
         "/arena/seasons/..".to_owned(),
         "/arena/entrants/%2e%2e/trades".to_owned(),
@@ -1642,7 +1591,7 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
 
 #[tokio::test]
 async fn a_query_string_reaches_the_upstream_byte_for_byte() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     // A feed cursor sent without percent-encoding: `+` must not become a
     // space and `|` must not be encoded on the way through.
     let raw_cursor = "2026-10-01T12:00:00.123456+00:00|5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11|0";
@@ -1661,7 +1610,7 @@ async fn a_query_string_reaches_the_upstream_byte_for_byte() {
         assert_eq!(status, 200, "{query}");
     }
     let received: Vec<Option<String>> = gateway
-        .received(Upstream::Platform)
+        .received()
         .await
         .iter()
         .map(|request| request.url.query().map(str::to_owned))
@@ -1674,17 +1623,17 @@ async fn a_query_string_reaches_the_upstream_byte_for_byte() {
 
 #[tokio::test]
 async fn an_absolute_form_target_still_goes_to_the_configured_upstream() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let (status, _) = raw_request(&gateway.base, &raw_get("http://evil.example/me"), b"").await;
     assert_eq!(status, 200);
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].url.path(), "/me");
 }
 
 #[tokio::test]
 async fn health_answers_without_calling_any_upstream() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let response = gateway.send(Method::GET, "/health").await;
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = json(response).await;
@@ -1701,7 +1650,7 @@ async fn health_answers_without_calling_any_upstream() {
 
 #[tokio::test]
 async fn a_body_at_the_limit_is_forwarded() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     let body = vec![b'a'; MAX_REQUEST_BODY_BYTES];
     let response = gateway
         .http
@@ -1712,13 +1661,13 @@ async fn a_body_at_the_limit_is_forwarded() {
         .await
         .expect("the gateway answers");
     assert_eq!(response.status(), StatusCode::OK);
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(received[0].body.len(), MAX_REQUEST_BODY_BYTES);
 }
 
 #[tokio::test]
 async fn a_body_over_the_limit_answers_413_without_reaching_the_upstream() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
 
     // Declared too large: refused from the header alone.
     let head = format!(
@@ -1751,26 +1700,9 @@ async fn a_body_over_the_limit_answers_413_without_reaching_the_upstream() {
 
 #[tokio::test]
 async fn an_unreachable_upstream_answers_502_in_the_error_shape() {
-    let indexer = MockServer::start().await;
-    let base = serve(
-        &closed_port_url().await,
-        &indexer.uri(),
-        Duration::from_secs(2),
-    )
-    .await;
+    let base = serve(&closed_port_url().await, Duration::from_secs(2)).await;
     let response = test_client()
         .get(format!("{base}/me"))
-        .send()
-        .await
-        .expect("the gateway answers");
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body: Value = json(response).await;
-    assert_error_shape(&body, 502, "upstream");
-
-    let api = MockServer::start().await;
-    let base = serve(&api.uri(), &closed_port_url().await, Duration::from_secs(2)).await;
-    let response = test_client()
-        .get(format!("{base}/tokens/{MINT}/candles?res=1"))
         .send()
         .await
         .expect("the gateway answers");
@@ -1997,7 +1929,7 @@ async fn a_swap_reaches_the_platform_with_body_and_token_intact() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.text().await.expect("body"), answer);
 
-    let received = gateway.received(Upstream::Platform).await;
+    let received = gateway.received().await;
     assert_eq!(received.len(), 1, "one call, never retried");
     let got = &received[0];
     assert_eq!(got.method, Method::POST);
@@ -2009,38 +1941,6 @@ async fn a_swap_reaches_the_platform_with_body_and_token_intact() {
         header(got, "content-length"),
         Some(&*SWAP_BODY.len().to_string())
     );
-    assert!(gateway.received(Upstream::Indexer).await.is_empty());
-}
-
-/// With the default `UPSTREAM_TIMEOUT_MS` (15s), a swap the platform takes
-/// 20s to answer still comes back: its own timeout is 65s.
-#[tokio::test]
-async fn a_swap_slower_than_the_default_timeout_still_succeeds() {
-    let gateway = Gateway::start_with_timeout(Duration::from_secs(15)).await;
-    let answer = r#"{"signature":"","status":"submitted"}"#;
-    Mock::given(any())
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(answer, "application/json")
-                .set_delay(Duration::from_secs(20)),
-        )
-        .mount(&gateway.api)
-        .await;
-
-    let started = Instant::now();
-    let response = gateway
-        .http
-        .post(gateway.url("/trade/swap"))
-        .header("authorization", "Bearer session.jwt")
-        .header("content-type", "application/json")
-        .body(SWAP_BODY)
-        .send()
-        .await
-        .expect("the gateway answers");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.text().await.expect("body"), answer);
-    assert!(started.elapsed() >= Duration::from_secs(20));
-    assert_eq!(gateway.received(Upstream::Platform).await.len(), 1);
 }
 
 /// Every money route outlasts the default timeout, and the routes beside them
@@ -2102,7 +2002,7 @@ async fn every_money_route_outlasts_the_default_timeout() {
 /// `{funding_id}` is checked as a UUID before anything is forwarded.
 #[tokio::test]
 async fn a_malformed_funding_id_answers_400_without_reaching_the_platform() {
-    let gateway = Gateway::with_ok_upstreams().await;
+    let gateway = Gateway::with_ok_upstream().await;
     for funding in [
         "not-a-uuid",
         "42",
@@ -2139,5 +2039,5 @@ async fn a_missing_bot_wallet_404_passes_through_unchanged() {
         .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.expect("body"), body);
-    assert_eq!(gateway.received(Upstream::Platform).await.len(), 1);
+    assert_eq!(gateway.received().await.len(), 1);
 }

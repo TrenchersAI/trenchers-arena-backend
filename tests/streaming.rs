@@ -228,7 +228,6 @@ impl Gateway {
         let api = upstream.url.clone();
         let mut config = Config::from_lookup(|name| match name {
             "PLATFORM_API_URL" => Some(api.clone()),
-            "INDEXER_API_URL" => Some("http://127.0.0.1:1".to_owned()),
             _ => None,
         })
         .expect("test config is valid");

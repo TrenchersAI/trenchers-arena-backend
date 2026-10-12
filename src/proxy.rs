@@ -30,9 +30,6 @@ pub const USER_AGENT: &str = concat!("trenchers-arena-backend/", env!("CARGO_PKG
 /// cookies and client-supplied `X-Forwarded-*` / `CF-*` headers, which the
 /// platform API would treat as the client's address.
 ///
-/// `Authorization` goes to the platform API only. The indexer serves public
-/// charts and never reads it, so a session token has no reason to go there.
-///
 /// reqwest adds `Host`, `User-Agent` and `Content-Length`, plus `Accept: */*`
 /// when the client sent no `Accept`.
 pub static FORWARDED_REQUEST_HEADERS: [HeaderName; 4] = [
@@ -54,7 +51,6 @@ pub static RETURNED_RESPONSE_HEADERS: [HeaderName; 3] = [
 pub struct Proxy {
     client: reqwest::Client,
     platform: Url,
-    indexer: Url,
     /// `UPSTREAM_TIMEOUT_MS`: the request body read, and every upstream call
     /// whose route sets no longer timeout.
     timeout: Duration,
@@ -77,7 +73,6 @@ impl Proxy {
         Ok(Self {
             client,
             platform: config.platform_api_url.clone(),
-            indexer: config.indexer_api_url.clone(),
             timeout: config.upstream_timeout,
             streams: config.streams,
             stream_permits: Arc::new(Semaphore::new(config.streams.concurrency)),
@@ -162,7 +157,6 @@ impl Proxy {
 
         let mut url = match route.upstream {
             Upstream::Platform => self.platform.clone(),
-            Upstream::Indexer => self.indexer.clone(),
         };
         // set_query may percent-encode a few bytes (a raw `'`, for example);
         // they decode to the same value.
@@ -193,9 +187,6 @@ impl Proxy {
             .request(parts.method.clone(), url)
             .timeout(timeout);
         for name in &FORWARDED_REQUEST_HEADERS {
-            if name == header::AUTHORIZATION && route.upstream == Upstream::Indexer {
-                continue;
-            }
             for value in parts.headers.get_all(name) {
                 let mut value = value.clone();
                 value.set_sensitive(name == header::AUTHORIZATION);
@@ -355,7 +346,6 @@ mod tests {
     fn proxy(platform: &str, default: Duration) -> Proxy {
         let vars = HashMap::from([
             ("PLATFORM_API_URL", platform.to_owned()),
-            ("INDEXER_API_URL", "http://127.0.0.1:1".to_owned()),
             ("UPSTREAM_TIMEOUT_MS", default.as_millis().to_string()),
         ]);
         let config = Config::from_lookup(|name| vars.get(name).cloned()).expect("valid config");

@@ -16,7 +16,9 @@ pub struct Config {
     /// The indexer API: token charts.
     pub indexer_api_url: Url,
     pub port: u16,
-    /// One upstream call, from connect until its whole body is read.
+    /// One upstream call, from connect until its whole body is read, unless
+    /// the route sets a longer timeout. Also the limit for reading the
+    /// client's request body, on every route.
     pub upstream_timeout: Duration,
 }
 

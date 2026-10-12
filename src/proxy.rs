@@ -41,15 +41,20 @@ pub static FORWARDED_REQUEST_HEADERS: [HeaderName; 4] = [
 ];
 
 /// Response headers passed back to the client. hyper adds `Content-Length`
-/// and `Date`.
-pub static RETURNED_RESPONSE_HEADERS: [HeaderName; 2] =
-    [header::CONTENT_TYPE, header::CACHE_CONTROL];
+/// and `Date`. `Retry-After` tells the app when to retry a 429 or 503.
+pub static RETURNED_RESPONSE_HEADERS: [HeaderName; 3] = [
+    header::CONTENT_TYPE,
+    header::CACHE_CONTROL,
+    header::RETRY_AFTER,
+];
 
 #[derive(Clone)]
 pub struct Proxy {
     client: reqwest::Client,
     platform: Url,
     indexer: Url,
+    /// `UPSTREAM_TIMEOUT_MS`: the request body read, and every upstream call
+    /// whose route sets no longer timeout.
     timeout: Duration,
 }
 
@@ -57,8 +62,6 @@ impl Proxy {
     pub fn new(config: &Config) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            // Covers connecting, the response headers and the body.
-            .timeout(config.upstream_timeout)
             // Following a redirect would send the caller's token to whatever
             // host `Location` points at.
             .redirect(reqwest::redirect::Policy::none())
@@ -72,6 +75,14 @@ impl Proxy {
             indexer: config.indexer_api_url.clone(),
             timeout: config.upstream_timeout,
         })
+    }
+
+    /// The upstream timeout for `route`: its own when that is longer than the
+    /// default, so raising `UPSTREAM_TIMEOUT_MS` never shortens a route.
+    pub fn timeout_for(&self, route: &Route) -> Duration {
+        route
+            .timeout
+            .map_or(self.timeout, |timeout| timeout.max(self.timeout))
     }
 
     /// Forwards `request` and logs one line for it, without headers, bodies or
@@ -151,7 +162,11 @@ impl Proxy {
         url.set_path(&path);
         url.set_query(parts.uri.query());
 
-        let mut upstream = self.client.request(parts.method.clone(), url);
+        let mut upstream = self
+            .client
+            .request(parts.method.clone(), url)
+            // Covers connecting, the response headers and the body.
+            .timeout(self.timeout_for(route));
         for name in &FORWARDED_REQUEST_HEADERS {
             if name == header::AUTHORIZATION && route.upstream == Upstream::Indexer {
                 continue;
@@ -187,8 +202,10 @@ impl Proxy {
         Ok(out)
     }
 
-    /// Reads the request body up to the size limit. The upstream timeout also
-    /// applies, so a slow client can't hold a concurrency permit indefinitely.
+    /// Reads the request body up to the size limit, within the default timeout
+    /// even on routes with a longer one, so a slow client can't hold a
+    /// concurrency permit for long. Nothing has gone upstream yet, so the 408
+    /// is always safe to retry.
     async fn read_body(&self, headers: &HeaderMap, body: Body) -> Result<Vec<u8>, GatewayError> {
         let declared = headers
             .get(header::CONTENT_LENGTH)
@@ -270,4 +287,109 @@ fn chain(error: &GatewayError) -> String {
         source = cause.source();
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::http::StatusCode;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::routes::{Limit, Verb};
+
+    /// A money route with a short timeout, so tests can run past it.
+    static SLOW_TRADE: Route = Route {
+        verb: Verb::Post,
+        path: "/slow",
+        upstream: Upstream::Platform,
+        upstream_path: "/slow",
+        limit: Some(Limit::Trade),
+        timeout: Some(Duration::from_secs(1)),
+    };
+
+    fn proxy(platform: &str, default: Duration) -> Proxy {
+        let vars = HashMap::from([
+            ("PLATFORM_API_URL", platform.to_owned()),
+            ("INDEXER_API_URL", "http://127.0.0.1:1".to_owned()),
+            ("UPSTREAM_TIMEOUT_MS", default.as_millis().to_string()),
+        ]);
+        let config = Config::from_lookup(|name| vars.get(name).cloned()).expect("valid config");
+        Proxy::new(&config).expect("the client builds")
+    }
+
+    #[test]
+    fn should_never_use_a_route_timeout_shorter_than_the_default() {
+        let route = |timeout| Route {
+            timeout,
+            ..SLOW_TRADE
+        };
+        let secs = Duration::from_secs;
+        let cases = [
+            (None, secs(15), secs(15)),
+            (Some(secs(35)), secs(15), secs(35)),
+            (Some(secs(35)), secs(60), secs(60)),
+        ];
+        for (timeout, default, expected) in cases {
+            let proxy = proxy("http://127.0.0.1:1", default);
+            assert_eq!(
+                proxy.timeout_for(&route(timeout)),
+                expected,
+                "route {timeout:?}, default {default:?}"
+            );
+        }
+    }
+
+    /// With a 100ms default, a 1s route still waits 400ms for the upstream,
+    /// and still gives up after its own timeout.
+    #[tokio::test]
+    async fn should_wait_for_the_route_timeout_and_no_longer() {
+        let upstream = MockServer::start().await;
+        let proxy = proxy(&upstream.uri(), Duration::from_millis(100));
+        let send = || {
+            proxy.forward(
+                &SLOW_TRADE,
+                Request::post("/slow").body(Body::empty()).expect("request"),
+            )
+        };
+
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"ok":true}"#, "application/json")
+                    .set_delay(Duration::from_millis(400)),
+            )
+            .mount(&upstream)
+            .await;
+        let response = send().await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        upstream.reset().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .mount(&upstream)
+            .await;
+        let started = Instant::now();
+        let response = send().await;
+        let waited = started.elapsed();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            waited >= Duration::from_secs(1) && waited < Duration::from_millis(2500),
+            "gave up after {waited:?}"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "platform-api did not answer in time",
+                "code": 502,
+                "category": "upstream",
+            })
+        );
+    }
 }

@@ -24,13 +24,17 @@ What the gateway does on every request:
 3. Forward the request: same method, path and query string, the request body, and only
    the `Content-Type`, `Accept` and `Idempotency-Key` headers, plus `Authorization` for
    the platform API. The indexer never reads a session token, so it never gets one.
-4. Return the upstream status and body unchanged, with only `Content-Type` and
-   `Cache-Control` copied back.
+4. Return the upstream status and body unchanged, with only `Content-Type`,
+   `Cache-Control` and `Retry-After` copied back.
 
 Each group of routes has its own limit on in-flight requests (`src/routes.rs`): 64 for
-the platform API, 32 for the Arena routes and 32 for charts. A request over its group's
-limit waits. The app polls the Arena routes, so slow Arena reads fill only their own
-limit and never make a sign-in or a bot action wait.
+the platform API, 32 for the Arena routes, 32 for charts and 16 for the routes that move
+money. A request over its group's limit waits. The app polls the Arena routes, so slow
+Arena reads fill only their own limit and never make a sign-in or a bot action wait. The
+app's polling (fleet stats every 30s) sits in the platform group, so it never makes a
+swap or an order wait either. The platform's own money group allows 10 in flight and
+queues the rest; 16 is above that, so the gateway only holds money calls back once the
+platform is badly backed up.
 
 The gateway does not check tokens, clamp query values or cache anything. The platform
 API does all of that, and its answers (including 401, 404 and plain-text errors) come
@@ -80,13 +84,47 @@ Platform API routes keep their path. The only renamed route is the chart route.
 | GET | `/orders` | platform | |
 | GET | `/orders/{id}/events` | platform | `id`: UUID |
 | POST | `/public/tokens-meta` | platform | |
+| DELETE | `/orders/{id}` | platform (money route, 35s) | `id`: UUID |
 
 `/fees/recommendation`, `/wallets/{address}/sol-balance` and `/public/tokens-meta` take
 no token on the platform; the others need one. `/public/tokens-meta` takes a JSON body
 `{ "mints": [...] }` (at most 100) and shares one rate limit across all app users (see
-[Known limit](#known-limit-per-ip-rate-limits-are-shared)). Order writes and the money
-routes (`/trade/*`, `POST /orders`, `/solana/*`, bot wallet actions) are not forwarded
-yet.
+[Known limit](#known-limit-per-ip-rate-limits-are-shared)). `DELETE /orders/{id}` is the
+first money route (see [Money routes](#money-routes)); the others (`/trade/*`,
+`POST /orders`, `/solana/*`, bot wallet actions) are not forwarded yet.
+
+### Money routes
+
+Routes that move money (swaps, orders, wallet transfers) are declared with `trade()`
+in `src/routes.rs`. Each one gets:
+
+- **Its own limit group** (16 in flight), separate from the app's polling.
+- **Its own upstream timeout**, a few seconds longer than the app waits for that call,
+  so the gateway never gives up first. `UPSTREAM_TIMEOUT_MS` is a floor: if it is set
+  higher than a route's timeout, the route uses it. Reading the request body keeps
+  `UPSTREAM_TIMEOUT_MS` on every route: nothing has gone upstream yet, so its 408 is
+  safe to retry, and a stalled client can't hold a money permit for long.
+
+| Route | Gateway timeout | App timeout |
+|-------|-----------------|-------------|
+| `DELETE /orders/{id}` | 35s | 30s |
+
+Planned for the next money routes (same rule, app timeout + 5s):
+
+| Route | Gateway timeout | App timeout |
+|-------|-----------------|-------------|
+| `POST /trade/swap`, `POST /orders` | 65s | 60s |
+| `POST /trade/swap/prepare`, `/trade/swap/complete`, `/trade/sell-init/quote`, `POST /solana/submit` | 35s | 30s |
+| `POST /bots/{id}/wallet/fund`, `/bots/{id}/wallet/withdraw` | 20s | 15s (the app's default) |
+
+When a money route times out the app gets the gateway's
+`502 {"error":"platform-api did not answer in time","code":502,"category":"upstream"}`,
+but the platform may still finish the work. Treat that 502 as "outcome unknown": check
+the order or trade list before retrying, because `POST /orders` and the wallet transfers
+carry no idempotency key. The gateway never retries a request by itself.
+
+The platform's 429 and 503 answers may carry `Retry-After`; it comes back to the app
+unchanged.
 
 ### Arena routes
 
@@ -134,15 +172,18 @@ The source for these facts is the platform API (`solana-terminal`, `crates/st-ap
 
 Some patterns share a prefix: `/bots/stats` (and the other static `/bots/...` reads,
 including `/bots/wallets`) and `/bots/{id}`, `/arena/seasons` and
-`/arena/seasons/{number}`, `/arena/entrants/{id}` and its tabs, and
-`/bots/{id}/arena-clone` next to the other `/bots/{id}/...` routes. axum matches whole
+`/arena/seasons/{number}`, `/arena/entrants/{id}` and its tabs,
+`/bots/{id}/arena-clone` next to the other `/bots/{id}/...` routes, and
+`DELETE /orders/{id}` next to `GET /orders/{id}/events`. axum matches whole
 segments and prefers a static segment over a `{param}`, whatever the order in
 `ROUTES`. The `route_precedence_tests` module in `src/routes.rs` checks this in both
 registration orders.
 
 ### Adding a route
 
-1. Add one line to `ROUTES` in `src/routes.rs`.
+1. Add one line to `ROUTES` in `src/routes.rs`: `api(verb, path)`, or
+   `trade(verb, path, timeout)` for a route that moves money (see Money routes), and
+   add it to `TRADE_ROUTES` in the unit tests.
 2. If it has a new `{param}` name, add its check to `src/validate.rs` (a unit test fails
    until you do).
 3. Add a row to `contract()` in `tests/gateway.rs` (a test fails until the two lists
@@ -158,7 +199,7 @@ Read from environment variables only (`src/config.rs`). See `.env.example`.
 | `PLATFORM_API_URL` | yes | | Platform API origin, `https://host[:port]`. Plain `http` only for localhost. |
 | `INDEXER_API_URL` | yes | | Indexer API origin, same rules. |
 | `PORT` | no | `8080` | Port to listen on. The gateway always binds all interfaces (`0.0.0.0`). |
-| `UPSTREAM_TIMEOUT_MS` | no | `15000` | Used twice: as the limit for reading the client's request body (on expiry: 408), and separately as the limit for one upstream call, including its response body (on expiry: 502). A slow body followed by a slow upstream can take up to twice this value. |
+| `UPSTREAM_TIMEOUT_MS` | no | `15000` | Used twice: as the limit for reading the client's request body on every route (on expiry: 408), and separately as the default limit for one upstream call, including its response body (on expiry: 502). Money routes set a longer upstream timeout (see Money routes), and this value is their floor. A slow body followed by a slow upstream can take the two limits added up. |
 | `RUST_LOG` | no | `info` | Log filter. |
 
 The URLs must be bare origins: no path, query, fragment or credentials. Do not commit

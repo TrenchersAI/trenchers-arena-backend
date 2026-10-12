@@ -489,6 +489,8 @@ fn contract() -> Vec<Case> {
             "/public/tokens-meta".into(),
             Some(TOKENS_META_BODY),
         ),
+        // Orders (writes)
+        api(M::DELETE, "/orders/{id}", format!("/orders/{ORDER}"), None),
     ]
 }
 
@@ -664,6 +666,30 @@ async fn a_request_without_authorization_is_forwarded_without_one() {
     assert_eq!(received[0].body, REFRESH_BODY.as_bytes());
 }
 
+/// An order cancel has no body; it goes upstream as an empty DELETE with
+/// `Content-Length: 0`, as OkHttp sends it.
+#[tokio::test]
+async fn an_order_cancel_is_forwarded_as_an_empty_delete() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let response = gateway
+        .http
+        .delete(gateway.url(&format!("/orders/{ORDER}")))
+        .header("authorization", "Bearer session.jwt")
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(received.len(), 1);
+    let got = &received[0];
+    assert_eq!(got.method, Method::DELETE);
+    assert_eq!(got.url.path(), format!("/orders/{ORDER}"));
+    assert_eq!(header(got, "authorization"), Some("Bearer session.jwt"));
+    assert!(got.body.is_empty());
+    assert_eq!(header(got, "content-length"), Some("0"));
+    assert_eq!(header(got, "content-type"), None);
+}
+
 #[tokio::test]
 async fn a_bodiless_action_is_forwarded_as_an_empty_post() {
     let gateway = Gateway::with_ok_upstreams().await;
@@ -723,14 +749,40 @@ async fn upstream_error_statuses_and_bodies_pass_through_unchanged() {
     }
 }
 
+/// The platform's 429 and 503 may say when to retry; the app sees it.
 #[tokio::test]
-async fn only_content_type_and_cache_control_come_back_from_the_upstream() {
+async fn retry_after_comes_back_with_a_429_or_503() {
+    let gateway = Gateway::start().await;
+    for status in [429, 503] {
+        gateway.api.reset().await;
+        let body = format!(r#"{{"error":"busy","code":{status},"category":"upstream"}}"#);
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_raw(body.clone(), "application/json")
+                    .insert_header("retry-after", "2"),
+            )
+            .mount(&gateway.api)
+            .await;
+        let response = gateway
+            .send(Method::DELETE, &format!("/orders/{ORDER}"))
+            .await;
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["retry-after"], "2", "{status}");
+        assert_eq!(response.text().await.expect("body"), body, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn only_allowlisted_response_headers_come_back_from_the_upstream() {
     let gateway = Gateway::start().await;
     Mock::given(any())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_raw(r#"{"entrants":[]}"#, "application/json; charset=utf-8")
                 .insert_header("cache-control", "private, max-age=10")
+                .insert_header("retry-after", "5")
+                .insert_header("idempotent-replayed", "true")
                 .insert_header("set-cookie", "upstream=1; Secure")
                 .insert_header("link", "</terminal/x/candles>; rel=\"canonical\"")
                 .insert_header("x-powered-by", "upstream")
@@ -747,8 +799,15 @@ async fn only_content_type_and_cache_control_come_back_from_the_upstream() {
     let headers = response.headers();
     assert_eq!(headers["content-type"], "application/json; charset=utf-8");
     assert_eq!(headers["cache-control"], "private, max-age=10");
+    assert_eq!(headers["retry-after"], "5");
     let names: BTreeSet<&str> = headers.keys().map(|name| name.as_str()).collect();
-    let allowed = BTreeSet::from(["cache-control", "content-length", "content-type", "date"]);
+    let allowed = BTreeSet::from([
+        "cache-control",
+        "content-length",
+        "content-type",
+        "date",
+        "retry-after",
+    ]);
     assert!(
         names.is_subset(&allowed),
         "upstream headers that must not reach the app: {:?}",
@@ -1263,6 +1322,8 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::PUT, format!("/arena/entrants/{ENTRANT}/clone")),
         (Method::POST, "/arena/season".into()),
         (Method::POST, format!("/bots/{BOT}/arena-clone")),
+        (Method::DELETE, "/orders".into()),
+        (Method::PUT, format!("/orders/{ORDER}")),
         // Arena paths that only look like listed ones.
         (Method::GET, "/arena".into()),
         (Method::GET, "/arena/entrants".into()),
@@ -1278,7 +1339,6 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::POST, "/health".into()),
         // Money and order writes stay closed for now.
         (Method::POST, "/orders".into()),
-        (Method::DELETE, format!("/orders/{ORDER}")),
         (Method::POST, "/trade/buy".into()),
         (Method::POST, format!("/bots/{BOT}/wallet")),
         // Neighbours of the account and portfolio reads that aren't listed.
@@ -1381,6 +1441,8 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         (Method::GET, "/arena/seasons/6x".into()),
         (Method::GET, "/arena/seasons/1.5".into()),
         (Method::GET, "/arena/seasons/99999999999".into()),
+        (Method::DELETE, "/orders/not-a-uuid".into()),
+        (Method::DELETE, format!("/orders/{MINT}")),
         // Not base58 (0, O, I and l are outside the alphabet).
         (
             Method::GET,
@@ -1664,4 +1726,101 @@ async fn a_slow_upstream_answers_502_once_the_timeout_expires() {
     );
     let body: Value = json(response).await;
     assert_error_shape(&body, 502, "upstream");
+}
+
+/// Money routes have their own concurrency limit: while slow polls fill the
+/// platform limit, an order cancel still goes straight through.
+#[tokio::test]
+async fn slow_polls_do_not_delay_an_order_cancel() {
+    const POLL_DELAY: Duration = Duration::from_secs(3);
+    let gateway = Gateway::start().await;
+    Mock::given(wiremock::matchers::path("/bots/stats"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("[]", "application/json")
+                .set_delay(POLL_DELAY),
+        )
+        .mount(&gateway.api)
+        .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"))
+        .mount(&gateway.api)
+        .await;
+
+    // More polls than the whole platform limit (64).
+    let polls: Vec<_> = (0..80)
+        .map(|_| {
+            let request = gateway
+                .http
+                .get(gateway.url(&format!("/bots/stats?ids={BOT}")));
+            tokio::spawn(request.send())
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = Instant::now();
+    let response = gateway
+        .http
+        .delete(gateway.url(&format!("/orders/{ORDER}")))
+        .header("authorization", "Bearer session.jwt")
+        .send()
+        .await
+        .expect("the gateway answers");
+    let waited = started.elapsed();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        waited < Duration::from_secs(1),
+        "the cancel waited {waited:?} behind polls"
+    );
+
+    for poll in polls {
+        let response = poll.await.expect("join").expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+/// A money route's own timeout is longer than the default. With a 200ms
+/// default, a cancel still waits out a 1s upstream, while an ordinary route
+/// gives up. Later money routes can reuse this pattern.
+#[tokio::test]
+async fn a_money_route_outlasts_the_default_timeout() {
+    let gateway = Gateway::start_with_timeout(Duration::from_millis(200)).await;
+    let body = format!(r#"{{"id":"{ORDER}","status":"cancelled"}}"#);
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(body.clone(), "application/json")
+                .set_delay(Duration::from_secs(1)),
+        )
+        .mount(&gateway.api)
+        .await;
+
+    let response = gateway
+        .send(Method::DELETE, &format!("/orders/{ORDER}"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), body);
+
+    let response = gateway.send(Method::GET, "/bots").await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_error_shape(&json(response).await, 502, "upstream");
+}
+
+/// Reading the request body keeps the default timeout on a money route, so a
+/// stalled client can't hold a trade permit for the route's whole timeout.
+#[tokio::test]
+async fn a_stalled_body_on_a_money_route_answers_408_after_the_default_timeout() {
+    let gateway = Gateway::start_with_timeout(Duration::from_millis(200)).await;
+    let head = format!(
+        "DELETE /orders/{ORDER} HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
+    );
+    let started = Instant::now();
+    let (status, _) = raw_request(&gateway.base, &head, b"{").await;
+    assert_eq!(status, 408);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "took {:?}, not the default timeout",
+        started.elapsed()
+    );
+    gateway.assert_no_upstream_calls().await;
 }

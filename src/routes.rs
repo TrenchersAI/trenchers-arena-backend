@@ -2,17 +2,18 @@
 //! 404 and never reaches an upstream.
 
 use std::fmt;
+use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::{Method, Uri};
-use axum::routing::{get, post, put, MethodRouter};
+use axum::routing::{delete, get, post, put, MethodRouter};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::error::GatewayError;
 use crate::proxy::Proxy;
-use Verb::{Get, Post, Put};
+use Verb::{Delete, Get, Post, Put};
 
 /// Max in-flight requests to the platform API, other than the Arena routes.
 /// Requests over a limit wait.
@@ -26,6 +27,12 @@ const ARENA_CONCURRENCY: usize = 32;
 /// Max in-flight chart requests, kept separate so chart traffic can't delay
 /// sign-ins or bot actions.
 const INDEXER_CONCURRENCY: usize = 32;
+
+/// Max in-flight requests that move money (swaps, orders, transfers). Their
+/// own limit, so a swap never waits behind the app's polling. Above the
+/// platform's own money cap (10, shared with the web app and queued there), so
+/// the gateway only holds requests back once the platform is badly backed up.
+const TRADE_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Upstream {
@@ -50,6 +57,7 @@ pub enum Limit {
     Platform,
     Arena,
     Indexer,
+    Trade,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +65,7 @@ pub enum Verb {
     Get,
     Post,
     Put,
+    Delete,
 }
 
 impl Verb {
@@ -65,6 +74,7 @@ impl Verb {
             Self::Get => Method::GET,
             Self::Post => Method::POST,
             Self::Put => Method::PUT,
+            Self::Delete => Method::DELETE,
         }
     }
 }
@@ -77,10 +87,17 @@ pub struct Route {
     pub upstream: Upstream,
     /// Upstream path; its `{name}` segments are filled from the request path.
     pub upstream_path: &'static str,
+    /// The limit group, or `None` to take it from the path.
+    pub limit: Option<Limit>,
+    /// Upstream timeout, used when it is longer than `UPSTREAM_TIMEOUT_MS`.
+    pub timeout: Option<Duration>,
 }
 
 impl Route {
     pub fn limit(&self) -> Limit {
+        if let Some(limit) = self.limit {
+            return limit;
+        }
         let arena = self.path.starts_with("/arena/") || self.path == "/bots/{id}/arena-clone";
         match self.upstream {
             Upstream::Indexer => Limit::Indexer,
@@ -135,6 +152,19 @@ const fn api(verb: Verb, path: &'static str) -> Route {
         path,
         upstream: Upstream::Platform,
         upstream_path: path,
+        limit: None,
+        timeout: None,
+    }
+}
+
+/// A platform API route that moves money: the trade limit, and an upstream
+/// timeout longer than the app's own, so the gateway never gives up on a
+/// swap, order or transfer the platform may still complete.
+const fn trade(verb: Verb, path: &'static str, timeout: Duration) -> Route {
+    Route {
+        limit: Some(Limit::Trade),
+        timeout: Some(timeout),
+        ..api(verb, path)
     }
 }
 
@@ -186,6 +216,8 @@ pub static ROUTES: &[Route] = &[
         path: "/tokens/{mint}/candles",
         upstream: Upstream::Indexer,
         upstream_path: "/terminal/{mint}/candles",
+        limit: None,
+        timeout: None,
     },
     // Account settings
     api(Get, "/me/settings"),
@@ -204,6 +236,8 @@ pub static ROUTES: &[Route] = &[
     api(Get, "/orders/{id}/events"),
     // Public
     api(Post, "/public/tokens-meta"),
+    // Orders (writes). The app waits 30s for a cancel.
+    trade(Delete, "/orders/{id}", Duration::from_secs(35)),
 ];
 
 /// Builds the router: the allowed routes, `GET /health`, and a JSON 404 for
@@ -213,6 +247,7 @@ pub fn router(proxy: Proxy) -> Router {
         .merge(limited(group(Limit::Platform), PLATFORM_CONCURRENCY))
         .merge(limited(group(Limit::Arena), ARENA_CONCURRENCY))
         .merge(limited(group(Limit::Indexer), INDEXER_CONCURRENCY))
+        .merge(limited(group(Limit::Trade), TRADE_CONCURRENCY))
         // Outside the limits, so health checks never wait behind upstream calls.
         .route("/health", get(health))
         .fallback(not_found)
@@ -247,6 +282,7 @@ fn forwarding(route: &'static Route) -> MethodRouter<Proxy> {
         Get => get(handler),
         Post => post(handler),
         Put => put(handler),
+        Delete => delete(handler),
     }
 }
 
@@ -337,6 +373,84 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// The routes that move money, with their upstream timeouts. Each is a
+    /// few seconds longer than the app waits for it.
+    const TRADE_ROUTES: &[(Verb, &str, u64)] = &[(Delete, "/orders/{id}", 35)];
+
+    #[test]
+    fn should_give_only_the_money_routes_the_trade_limit_and_a_timeout() {
+        for (verb, path, secs) in TRADE_ROUTES {
+            let route = ROUTES
+                .iter()
+                .find(|route| route.verb == *verb && route.path == *path)
+                .unwrap_or_else(|| panic!("{path} is listed"));
+            assert_eq!(route.limit(), Limit::Trade, "{path}");
+            assert_eq!(route.timeout, Some(Duration::from_secs(*secs)), "{path}");
+            assert_eq!(route.upstream, Upstream::Platform, "{path}");
+        }
+        for route in ROUTES {
+            let money = TRADE_ROUTES
+                .iter()
+                .any(|(verb, path, _)| route.verb == *verb && route.path == *path);
+            if !money {
+                assert_ne!(route.limit(), Limit::Trade, "{}", route.path);
+                assert_eq!(route.timeout, None, "{}", route.path);
+            }
+        }
+    }
+
+    /// `GET /orders` and `POST /orders` sit in different groups. axum merges
+    /// them into one path, and each method keeps its own group's limit.
+    #[tokio::test]
+    async fn should_keep_each_methods_limit_when_two_groups_share_a_path() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let slow = {
+            let (entered, release) = (entered.clone(), release.clone());
+            move || async move {
+                entered.notify_one();
+                release.notified().await;
+                "read"
+            }
+        };
+        let reads = limited(Router::new().route("/orders", get(slow)), 1);
+        let writes = limited(
+            Router::new().route("/orders", post(|| async { "write" })),
+            1,
+        );
+        let router = Router::new().merge(reads).merge(writes);
+        let request = |method: Method| {
+            Request::builder()
+                .method(method)
+                .uri("/orders")
+                .body(Body::empty())
+                .expect("request")
+        };
+
+        let holder = tokio::spawn(router.clone().oneshot(request(Method::GET)));
+        entered.notified().await;
+        let write = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.clone().oneshot(request(Method::POST)),
+        )
+        .await
+        .expect("the write must not wait for the read's permit")
+        .expect("infallible");
+        assert_eq!(write.status(), StatusCode::OK);
+
+        release.notify_one();
+        let read = holder.await.expect("join").expect("infallible");
+        assert_eq!(read.status(), StatusCode::OK);
     }
 
     #[test]
@@ -439,6 +553,7 @@ mod tests {
                 Get => MethodFilter::GET,
                 Post => MethodFilter::POST,
                 Put => MethodFilter::PUT,
+                Delete => MethodFilter::DELETE,
             }
         }
 
@@ -449,9 +564,14 @@ mod tests {
         }
 
         async fn matched(router: Router, uri: &str) -> (StatusCode, String) {
+            method_matched(router, Method::GET, uri).await
+        }
+
+        async fn method_matched(router: Router, method: Method, uri: &str) -> (StatusCode, String) {
             let response = router
                 .oneshot(
                     Request::builder()
+                        .method(method)
                         .uri(uri)
                         .body(Body::empty())
                         .expect("build request"),
@@ -570,6 +690,42 @@ mod tests {
                         matched(build(), &uri).await.0,
                         StatusCode::NOT_FOUND,
                         "{label}: {uri}"
+                    );
+                }
+            }
+        }
+
+        /// `DELETE /orders/{id}` and `GET /orders/{id}/events` each reach their
+        /// own pattern in either order, and neither swallows the other.
+        #[tokio::test]
+        async fn an_order_cancel_and_its_event_stream_reach_their_own_route() {
+            let id = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+            for (label, router) in [
+                ("table order", echo_router(ROUTES.iter())),
+                ("reverse order", echo_router(ROUTES.iter().rev())),
+            ] {
+                let build = || router.clone();
+                assert_eq!(
+                    method_matched(build(), Method::DELETE, &format!("/orders/{id}")).await,
+                    (StatusCode::OK, "/orders/{id}".to_owned()),
+                    "{label}"
+                );
+                assert_eq!(
+                    method_matched(build(), Method::GET, &format!("/orders/{id}/events")).await,
+                    (StatusCode::OK, "/orders/{id}/events".to_owned()),
+                    "{label}"
+                );
+                for (method, uri) in [
+                    (Method::GET, format!("/orders/{id}")),
+                    (Method::DELETE, format!("/orders/{id}/events")),
+                    (Method::DELETE, "/orders".to_owned()),
+                    (Method::DELETE, format!("/orders/{id}/extra")),
+                    (Method::GET, format!("/orders/{id}/events/extra")),
+                ] {
+                    assert_ne!(
+                        method_matched(build(), method.clone(), &uri).await.0,
+                        StatusCode::OK,
+                        "{label}: {method} {uri}"
                     );
                 }
             }

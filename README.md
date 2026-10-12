@@ -68,6 +68,25 @@ Platform API routes keep their path. The only renamed route is the chart route.
 | GET | `/bots/{id}/trades` | platform | `id`: UUID |
 | GET | `/bots/{id}/watching` | platform | `id`: UUID |
 | GET | `/tokens/{mint}/candles` | indexer, as `/terminal/{mint}/candles` | `mint`: base58 address |
+| GET | `/me/settings` | platform | |
+| PUT | `/me/settings` | platform | |
+| GET | `/portfolio` | platform | |
+| GET | `/portfolio/holdings` | platform | |
+| GET | `/portfolio/realized` | platform | |
+| GET | `/trades` | platform | |
+| GET | `/fees/recommendation` | platform | |
+| GET | `/wallets/{address}/sol-balance` | platform | `address`: base58 address |
+| GET | `/bots/wallets` | platform | |
+| GET | `/orders` | platform | |
+| GET | `/orders/{id}/events` | platform | `id`: UUID |
+| POST | `/public/tokens-meta` | platform | |
+
+`/fees/recommendation`, `/wallets/{address}/sol-balance` and `/public/tokens-meta` take
+no token on the platform; the others need one. `/public/tokens-meta` takes a JSON body
+`{ "mints": [...] }` (at most 100) and shares one rate limit across all app users (see
+[Known limit](#known-limit-per-ip-rate-limits-are-shared)). Order writes and the money
+routes (`/trade/*`, `POST /orders`, `/solana/*`, bot wallet actions) are not forwarded
+yet.
 
 ### Arena routes
 
@@ -113,7 +132,8 @@ The source for these facts is the platform API (`solana-terminal`, `crates/st-ap
 
 ### Route precedence
 
-Some patterns share a prefix: `/bots/stats` and `/bots/{id}`, `/arena/seasons` and
+Some patterns share a prefix: `/bots/stats` (and the other static `/bots/...` reads,
+including `/bots/wallets`) and `/bots/{id}`, `/arena/seasons` and
 `/arena/seasons/{number}`, `/arena/entrants/{id}` and its tabs, and
 `/bots/{id}/arena-clone` next to the other `/bots/{id}/...` routes. axum matches whole
 segments and prefers a static segment over a `{param}`, whatever the order in
@@ -144,7 +164,7 @@ Read from environment variables only (`src/config.rs`). See `.env.example`.
 The URLs must be bare origins: no path, query, fragment or credentials. Do not commit
 real service URLs; keep them in `.env` (git-ignored) or the host's settings.
 
-## Known limit: sign-in rate limits are shared
+## Known limit: per-IP rate limits are shared
 
 Read this before pointing the gateway at real users.
 
@@ -157,6 +177,11 @@ The gateway drops all client-IP headers, so the platform sees every app user as 
 caller: either the shared bucket or the gateway's own address. Across the whole user
 base that is 20 sign-ins and 120 refreshes per minute in total. The 21st sign-in in a
 minute gets `429` even if that user tried once.
+
+`POST /public/tokens-meta` is affected the same way. The platform limits it to 60
+requests per minute per client IP (`pubip:{CF-Connecting-IP}`), so through the gateway
+all app users share those 60. The app calls it whenever it needs names and logos for
+mints it has not seen, so expect `429`s on it with more than a handful of active users.
 
 Forwarding `CF-Connecting-IP` from the gateway does not fix this: a client could set it
 to anything, and Cloudflare in front of the platform would overwrite it. The fix needs a

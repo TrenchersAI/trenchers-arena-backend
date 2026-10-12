@@ -71,11 +71,12 @@ Platform API routes keep their path. The only renamed route is the chart route.
 
 ### Arena routes
 
-All twelve Arena routes go to the platform API on the same path. The auth and query
+All thirteen Arena routes go to the platform API on the same path. The auth and query
 columns describe what the platform does with them; the gateway only passes them on.
 
 | Method | Path | Platform auth | Query params (platform default, range) |
 |--------|------|---------------|----------------------------------------|
+| GET | `/arena/paper-bots` | none (gate only) | none; rolling 24h closed profit before fees, refreshed every 60s |
 | GET | `/arena/season` | none (a token only affects the arena gate) | |
 | GET | `/arena/entrants/{id}` | optional | |
 | GET | `/arena/feed` | none (gate only) | `limit` (30, 1..100), `before` (cursor) |

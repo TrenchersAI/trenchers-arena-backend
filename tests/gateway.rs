@@ -356,6 +356,12 @@ fn contract() -> Vec<Case> {
             None,
         ),
         // Arena: public
+        api(
+            M::GET,
+            "/arena/paper-bots",
+            "/arena/paper-bots".into(),
+            None,
+        ),
         api(M::GET, "/arena/season", "/arena/season".into(), None),
         api(
             M::GET,
@@ -773,7 +779,7 @@ async fn upstream_redirects_are_returned_not_followed() {
 // Arena
 // ---------------------------------------------------------------------------
 
-/// The twelve arena routes in the contract, including the clone provenance
+/// The thirteen arena routes in the contract, including the clone provenance
 /// read that lives under `/bots`.
 fn arena_cases() -> Vec<Case> {
     contract()
@@ -785,7 +791,8 @@ fn arena_cases() -> Vec<Case> {
 }
 
 /// Arena routes whose handler takes no token. Only the gate looks at one.
-const PUBLIC_ARENA_PATTERNS: [&str; 5] = [
+const PUBLIC_ARENA_PATTERNS: [&str; 6] = [
+    "/arena/paper-bots",
     "/arena/season",
     "/arena/entrants/{id}",
     "/arena/feed",
@@ -794,9 +801,9 @@ const PUBLIC_ARENA_PATTERNS: [&str; 5] = [
 ];
 
 #[test]
-fn the_contract_lists_all_twelve_arena_routes() {
+fn the_contract_lists_all_thirteen_arena_routes() {
     let patterns: Vec<&str> = arena_cases().iter().map(|case| case.pattern).collect();
-    assert_eq!(patterns.len(), 12, "{patterns:?}");
+    assert_eq!(patterns.len(), 13, "{patterns:?}");
     for pattern in PUBLIC_ARENA_PATTERNS {
         assert!(patterns.contains(&pattern), "{pattern}");
     }
@@ -806,6 +813,7 @@ fn the_contract_lists_all_twelve_arena_routes() {
 async fn public_arena_routes_are_forwarded_without_a_token() {
     let gateway = Gateway::with_ok_upstreams().await;
     let public = [
+        "/arena/paper-bots".to_owned(),
         "/arena/season".to_owned(),
         format!("/arena/entrants/{ENTRANT}"),
         "/arena/feed".to_owned(),
@@ -1041,6 +1049,7 @@ async fn arena_query_strings_are_forwarded_without_clamping_or_checks() {
 async fn arena_cache_control_comes_back_as_the_platform_set_it() {
     let gateway = Gateway::start().await;
     for (path, cache_control) in [
+        ("/arena/paper-bots".to_owned(), "no-store"),
         ("/arena/season".to_owned(), "public, max-age=30"),
         ("/arena/feed".to_owned(), "public, max-age=15"),
         (

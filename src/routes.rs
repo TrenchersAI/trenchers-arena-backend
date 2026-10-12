@@ -167,6 +167,7 @@ pub static ROUTES: &[Route] = &[
     api(Get, "/bots/{id}/watching"),
     api(Get, "/bots/{id}/arena-clone"),
     // Arena: public
+    api(Get, "/arena/paper-bots"),
     api(Get, "/arena/season"),
     api(Get, "/arena/entrants/{id}"),
     api(Get, "/arena/feed"),
@@ -304,7 +305,8 @@ mod tests {
             .filter(|route| route.limit() == Limit::Arena)
             .map(|route| route.path)
             .collect();
-        assert_eq!(arena.len(), 12, "all twelve Arena routes: {arena:?}");
+        assert_eq!(arena.len(), 13, "all thirteen Arena routes: {arena:?}");
+        assert!(arena.contains(&"/arena/paper-bots"));
         assert!(arena.contains(&"/bots/{id}/arena-clone"));
         for route in ROUTES {
             if route.path.starts_with("/auth/") || route.path == "/bots/{id}/pause" {

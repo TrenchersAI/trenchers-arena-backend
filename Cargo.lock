@@ -1339,6 +1339,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bs58",
+ "http-body",
  "reqwest",
  "serde",
  "serde_json",

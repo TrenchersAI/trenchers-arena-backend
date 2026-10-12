@@ -5,9 +5,10 @@ pub mod config;
 pub mod error;
 pub mod proxy;
 pub mod routes;
+pub mod stream;
 pub mod validate;
 
-pub use config::Config;
+pub use config::{Config, StreamLimits};
 
 /// Builds the gateway's axum router.
 pub fn app(config: &Config) -> Result<axum::Router, reqwest::Error> {

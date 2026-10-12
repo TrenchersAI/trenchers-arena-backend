@@ -25,7 +25,8 @@ What the gateway does on every request:
    the `Content-Type`, `Accept` and `Idempotency-Key` headers, plus `Authorization` for
    the platform API. The indexer never reads a session token, so it never gets one.
 4. Return the upstream status and body unchanged, with only `Content-Type`,
-   `Cache-Control` and `Retry-After` copied back.
+   `Cache-Control` and `Retry-After` copied back. The one streamed route passes its
+   events back as they arrive (see [Streaming](#streaming)).
 
 Each group of routes has its own limit on in-flight requests (`src/routes.rs`): 64 for
 the platform API, 32 for the Arena routes, 32 for charts and 16 for the routes that move
@@ -34,7 +35,9 @@ Arena reads fill only their own limit and never make a sign-in or a bot action w
 app's polling (fleet stats every 30s) sits in the platform group, so it never makes a
 swap or an order wait either. The platform's own money group allows 10 in flight and
 queues the rest; 16 is above that, so the gateway only holds money calls back once the
-platform is badly backed up.
+platform is badly backed up. Streamed AI answers have their own limit of 16 open
+streams per replica, and a request over it gets a `503` at once instead of waiting (see
+[Streaming](#streaming)).
 
 The gateway does not check tokens, clamp query values or cache anything. The platform
 API does all of that, and its answers (including 401, 404 and plain-text errors) come
@@ -85,6 +88,7 @@ Platform API routes keep their path. The only renamed route is the chart route.
 | GET | `/orders/{id}/events` | platform | `id`: UUID |
 | POST | `/public/tokens-meta` | platform | |
 | DELETE | `/orders/{id}` | platform (money route, 35s) | `id`: UUID |
+| POST | `/bots/{id}/ai/insight/stream` | platform (streamed, see [Streaming](#streaming)) | `id`: UUID |
 
 `/fees/recommendation`, `/wallets/{address}/sol-balance` and `/public/tokens-meta` take
 no token on the platform; the others need one. `/public/tokens-meta` takes a JSON body
@@ -125,6 +129,46 @@ carry no idempotency key. The gateway never retries a request by itself.
 
 The platform's 429 and 503 answers may carry `Retry-After`; it comes back to the app
 unchanged.
+
+### Streaming
+
+`POST /bots/{id}/ai/insight/stream` (the bot's AI insight card) is answered with
+server-sent events: `text {delta}` while the answer is written, then `done {reply}` or
+`error {message}`. It needs a token and a JSON body `{ "message": ... }`. It is declared
+with `stream()` in `src/routes.rs`; every other route is read whole before it is sent
+back.
+
+- **When it streams.** Only when the platform answers 2xx with
+  `Content-Type: text/event-stream`. Anything else (the AI rate limit's `429`, a `503`,
+  a `401` when AI access is off, a JSON body) is read whole and comes back unchanged,
+  `Retry-After` included. A `401` here does not mean the session ended.
+- **Headers.** `Content-Type` and `Cache-Control` come back from the platform, plus
+  `X-Accel-Buffering: no`, set by the gateway so a proxy in front of it doesn't buffer
+  the stream. There is no `Content-Length`; the body is chunked. The gateway never
+  compresses or buffers it.
+- **Timeouts** (`StreamLimits` in `src/config.rs`; fixed, not environment variables):
+
+  | Limit | Value | Why | On expiry |
+  |-------|-------|-----|-----------|
+  | Response headers | 35s | The app waits 30s for them, so it gives up first | `502` in the usual error body |
+  | Silence between chunks | 45s | The AI service sends a keep-alive every 15s | Stream ends (below) |
+  | Whole call | 5 min | An insight is at most five model calls of up to 60s | Stream ends (below) |
+
+- **Ending a stream early.** Once events have gone out, the status can't change. When
+  the gateway cuts a stream (silence, the 5-minute cap, or the platform's connection
+  breaking off), it sends one last event,
+  `event: error` / `data: {"message":"The answer was cut off. Please retry."}`, and ends
+  the body cleanly, so the app shows a retry message instead of a truncated answer. If
+  the app has already been sent `done` or `error`, nothing is added and the stream just
+  ends: the app treats any `error` event as a failure, even after `done`.
+- **Limit.** At most 16 open streams per replica. Each holds its permit until the stream
+  ends, not just until its headers. A request over the limit gets
+  `503 {"error":"too many AI answers in progress, retry shortly","code":503,"category":"upstream"}`
+  at once, because waiting would use up the app's 30s wait for the first byte. Streams
+  don't count against the other groups' limits.
+- **The app going away.** The gateway drops its connection to the platform as soon as it
+  notices, at its next write (the keep-alives make that within about 15s), and doesn't
+  read the rest of the stream. The platform then cancels the answer.
 
 ### Arena routes
 
@@ -174,7 +218,8 @@ Some patterns share a prefix: `/bots/stats` (and the other static `/bots/...` re
 including `/bots/wallets`) and `/bots/{id}`, `/arena/seasons` and
 `/arena/seasons/{number}`, `/arena/entrants/{id}` and its tabs,
 `/bots/{id}/arena-clone` next to the other `/bots/{id}/...` routes, and
-`DELETE /orders/{id}` next to `GET /orders/{id}/events`. axum matches whole
+`DELETE /orders/{id}` next to `GET /orders/{id}/events`, and
+`/bots/{id}/ai/insight/stream` under `/bots/{id}`. axum matches whole
 segments and prefers a static segment over a `{param}`, whatever the order in
 `ROUTES`. The `route_precedence_tests` module in `src/routes.rs` checks this in both
 registration orders.
@@ -183,7 +228,8 @@ registration orders.
 
 1. Add one line to `ROUTES` in `src/routes.rs`: `api(verb, path)`, or
    `trade(verb, path, timeout)` for a route that moves money (see Money routes), and
-   add it to `TRADE_ROUTES` in the unit tests.
+   add it to `TRADE_ROUTES` in the unit tests. A route answered with server-sent
+   events uses `stream(verb, path)` (see Streaming).
 2. If it has a new `{param}` name, add its check to `src/validate.rs` (a unit test fails
    until you do).
 3. Add a row to `contract()` in `tests/gateway.rs` (a test fails until the two lists
@@ -315,6 +361,8 @@ cargo test --locked
 ```
 
 `tests/gateway.rs` runs the gateway on a local port in front of two
-[wiremock](https://docs.rs/wiremock) servers and checks what each one receives. CI
+[wiremock](https://docs.rs/wiremock) servers and checks what each one receives.
+`tests/streaming.rs` puts a small axum upstream behind it instead, which feeds an event
+stream chunk by chunk, to test streaming, its timeouts, the AI limit and cancellation. CI
 (`.github/workflows/ci.yml`) runs the three commands above and a Docker build on every
 pull request.

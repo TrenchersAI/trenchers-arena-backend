@@ -31,6 +31,7 @@ const ALLOCATE_BODY: &str = r#"{"lamports":100000000}"#;
 const SETTINGS_BODY: &str =
     r#"{"ui_prefs":{"tradingPresets":{"buy":[{"amount_sol":"0.1","slippage_bps":500}]}}}"#;
 const TOKENS_META_BODY: &str = r#"{"mints":["So11111111111111111111111111111111111111112","EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]}"#;
+const INSIGHT_BODY: &str = r#"{"message":"Give me a two-line briefing on this bot."}"#;
 const CLONE_KEY: &str = "clone-6a1f9c2e-entrant-5b0e8f0e";
 const CLONE_BODY: &str =
     r#"{"name":"My Opus copy","idempotency_key":"clone-6a1f9c2e-entrant-5b0e8f0e"}"#;
@@ -491,6 +492,14 @@ fn contract() -> Vec<Case> {
         ),
         // Orders (writes)
         api(M::DELETE, "/orders/{id}", format!("/orders/{ORDER}"), None),
+        // AI, streamed. A JSON answer comes back whole, as here; streaming
+        // is tested in `tests/streaming.rs`.
+        api(
+            M::POST,
+            "/bots/{id}/ai/insight/stream",
+            format!("/bots/{BOT}/ai/insight/stream"),
+            Some(INSIGHT_BODY),
+        ),
     ]
 }
 

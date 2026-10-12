@@ -10,6 +10,7 @@ use crate::error::GatewayError;
 pub fn path_param(name: &'static str, raw: &str) -> Result<(), GatewayError> {
     let (valid, expected) = match name {
         "id" => (is_uuid(raw), "a UUID"),
+        "funding_id" => (is_uuid(raw), "a UUID"),
         "mint" => (is_mint(raw), "a base58 Solana address"),
         "address" => (is_mint(raw), "a base58 Solana address"),
         "number" => (is_season_number(raw), "a season number"),
@@ -24,10 +25,11 @@ pub fn path_param(name: &'static str, raw: &str) -> Result<(), GatewayError> {
 
 /// Whether `name` has a check in [`path_param`].
 pub fn is_known(name: &str) -> bool {
-    matches!(name, "id" | "mint" | "number" | "address")
+    matches!(name, "id" | "funding_id" | "mint" | "number" | "address")
 }
 
-/// Bot and entrant ids, in any form the `uuid` crate parses.
+/// Bot, entrant, order and bot wallet funding ids, in any form the `uuid`
+/// crate parses.
 pub fn is_uuid(raw: &str) -> bool {
     Uuid::try_parse(raw).is_ok()
 }
@@ -133,6 +135,39 @@ mod tests {
     }
 
     #[test]
+    fn should_check_a_funding_id_as_a_uuid() {
+        for raw in [
+            "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2f",
+            "0F8D2C4E-6A1B-4C3D-9E5F-7A8B9C0D1E2F",
+            "0f8d2c4e6a1b4c3d9e5f7a8b9c0d1e2f",
+        ] {
+            assert!(path_param("funding_id", raw).is_ok(), "{raw}");
+        }
+        for raw in [
+            "",
+            "funding",
+            "42",
+            "So11111111111111111111111111111111111111112",
+            "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2",
+            "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2f%2F..",
+            "..",
+            "%2e%2e",
+        ] {
+            let error = path_param("funding_id", raw).expect_err(raw);
+            assert!(
+                matches!(
+                    error,
+                    GatewayError::InvalidPathParam {
+                        name: "funding_id",
+                        expected: "a UUID"
+                    }
+                ),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
     fn should_check_each_known_parameter_with_its_own_rule() {
         assert!(path_param("id", "1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10").is_ok());
         assert!(path_param("id", "So11111111111111111111111111111111111111112").is_err());
@@ -146,7 +181,7 @@ mod tests {
         assert!(path_param("address", "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl").is_err());
         assert!(path_param("address", "..").is_err());
         assert!(path_param("address", &"1".repeat(44)).is_err());
-        for name in ["id", "mint", "number", "address"] {
+        for name in ["id", "funding_id", "mint", "number", "address"] {
             assert!(is_known(name), "{name}");
         }
     }

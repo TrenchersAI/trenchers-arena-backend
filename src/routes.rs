@@ -196,8 +196,8 @@ const fn stream(verb: Verb, path: &'static str) -> Route {
 
 /// Every forwarded route. `GET /health` is answered locally and isn't listed.
 ///
-/// `/bots/defaults`, `/bots/stats` and `/bots/leaderboard` overlap
-/// `/bots/{id}`. axum prefers the static segment regardless of order;
+/// `/bots/defaults`, `/bots/stats`, `/bots/leaderboard`, `/bots/wallets` and
+/// `/bots/live-confirm` overlap `/bots/{id}`. axum prefers the static segment regardless of order;
 /// `route_precedence_tests` checks it.
 pub static ROUTES: &[Route] = &[
     // Auth and account
@@ -267,6 +267,27 @@ pub static ROUTES: &[Route] = &[
     trade(Delete, "/orders/{id}", Duration::from_secs(35)),
     // AI, streamed (server-sent events). See "Streaming" in the README.
     stream(Post, "/bots/{id}/ai/insight/stream"),
+    // Live agent wallets. The app reads a 404 from `GET /bots/{id}/wallet` as
+    // "no wallet yet". Fund and withdraw are server-signed transfers without
+    // an idempotency key; the app waits 15s for them.
+    api(Post, "/bots/live-confirm"),
+    api(Post, "/bots/{id}/archive"),
+    api(Get, "/bots/{id}/wallet"),
+    api(Post, "/bots/{id}/wallet"),
+    api(Post, "/bots/{id}/wallet/delegated"),
+    trade(Post, "/bots/{id}/wallet/fund", Duration::from_secs(20)),
+    trade(Post, "/bots/{id}/wallet/withdraw", Duration::from_secs(20)),
+    api(Get, "/bots/{id}/wallet/funding/{funding_id}"),
+    // Trading. The app waits 60s for a swap or an order and 30s for the rest.
+    trade(Post, "/trade/swap", Duration::from_secs(65)),
+    trade(Post, "/trade/swap/prepare", Duration::from_secs(35)),
+    trade(Post, "/trade/swap/complete", Duration::from_secs(35)),
+    trade(Post, "/trade/sell-init/quote", Duration::from_secs(35)),
+    trade(Post, "/orders", Duration::from_secs(65)),
+    // Solana relay. The platform allowlists the RPC methods.
+    trade(Post, "/solana/submit", Duration::from_secs(35)),
+    api(Post, "/solana/rpc"),
+    api(Get, "/solana/blockhash"),
 ];
 
 /// Builds the router: the allowed routes, `GET /health`, and a JSON 404 for
@@ -408,7 +429,17 @@ mod tests {
 
     /// The routes that move money, with their upstream timeouts. Each is a
     /// few seconds longer than the app waits for it.
-    const TRADE_ROUTES: &[(Verb, &str, u64)] = &[(Delete, "/orders/{id}", 35)];
+    const TRADE_ROUTES: &[(Verb, &str, u64)] = &[
+        (Delete, "/orders/{id}", 35),
+        (Post, "/bots/{id}/wallet/fund", 20),
+        (Post, "/bots/{id}/wallet/withdraw", 20),
+        (Post, "/trade/swap", 65),
+        (Post, "/trade/swap/prepare", 35),
+        (Post, "/trade/swap/complete", 35),
+        (Post, "/trade/sell-init/quote", 35),
+        (Post, "/orders", 65),
+        (Post, "/solana/submit", 35),
+    ];
 
     #[test]
     fn should_give_only_the_money_routes_the_trade_limit_and_a_timeout() {
@@ -429,6 +460,29 @@ mod tests {
                 assert_ne!(route.limit(), Limit::Trade, "{}", route.path);
                 assert_eq!(route.timeout, None, "{}", route.path);
             }
+        }
+    }
+
+    /// The live-agent and Solana routes that move no money stay in the
+    /// platform group, on the default timeout.
+    #[test]
+    fn should_keep_the_other_live_agent_and_solana_routes_in_the_platform_group() {
+        for (verb, path) in [
+            (Post, "/bots/live-confirm"),
+            (Post, "/bots/{id}/archive"),
+            (Get, "/bots/{id}/wallet"),
+            (Post, "/bots/{id}/wallet"),
+            (Post, "/bots/{id}/wallet/delegated"),
+            (Get, "/bots/{id}/wallet/funding/{funding_id}"),
+            (Post, "/solana/rpc"),
+            (Get, "/solana/blockhash"),
+        ] {
+            let route = ROUTES
+                .iter()
+                .find(|route| route.verb == verb && route.path == path)
+                .unwrap_or_else(|| panic!("{path} is listed"));
+            assert_eq!(route.limit(), Limit::Platform, "{path}");
+            assert_eq!(route.timeout, None, "{path}");
         }
     }
 
@@ -682,6 +736,144 @@ mod tests {
                     (StatusCode::OK, "/bots/{id}/stats".to_owned()),
                     "{label}: the per-bot stats route is distinct from the batch"
                 );
+                assert_eq!(
+                    method_matched(build(), Method::POST, "/bots/live-confirm").await,
+                    (StatusCode::OK, "/bots/live-confirm".to_owned()),
+                    "{label}: /bots/live-confirm must reach its own route, not `/bots/{{id}}`"
+                );
+                // `GET /bots/live-confirm` is not a bot read: the static
+                // segment wins, and it only takes POST.
+                assert_ne!(
+                    matched(build(), "/bots/live-confirm").await.0,
+                    StatusCode::OK,
+                    "{label}"
+                );
+            }
+        }
+
+        /// The bot wallet routes sit under `/bots/{id}` next to `/bots/wallets`
+        /// and the other per-bot routes. Each reaches its own pattern in either
+        /// order, `funding` is not taken for `fund`, and nothing longer or
+        /// shorter reaches the funding read.
+        #[tokio::test]
+        async fn bot_wallet_routes_reach_their_own_route() {
+            let id = "1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10";
+            let funding = "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2f";
+            for (label, router) in [
+                ("table order", echo_router(ROUTES.iter())),
+                ("reverse order", echo_router(ROUTES.iter().rev())),
+            ] {
+                let build = || router.clone();
+                let cases = [
+                    (Method::GET, "/bots/wallets".to_owned(), "/bots/wallets"),
+                    (
+                        Method::GET,
+                        format!("/bots/{id}/wallet"),
+                        "/bots/{id}/wallet",
+                    ),
+                    (
+                        Method::POST,
+                        format!("/bots/{id}/wallet"),
+                        "/bots/{id}/wallet",
+                    ),
+                    (
+                        Method::POST,
+                        format!("/bots/{id}/wallet/delegated"),
+                        "/bots/{id}/wallet/delegated",
+                    ),
+                    (
+                        Method::POST,
+                        format!("/bots/{id}/wallet/fund"),
+                        "/bots/{id}/wallet/fund",
+                    ),
+                    (
+                        Method::POST,
+                        format!("/bots/{id}/wallet/withdraw"),
+                        "/bots/{id}/wallet/withdraw",
+                    ),
+                    (
+                        Method::GET,
+                        format!("/bots/{id}/wallet/funding/{funding}"),
+                        "/bots/{id}/wallet/funding/{funding_id}",
+                    ),
+                    (
+                        Method::POST,
+                        format!("/bots/{id}/archive"),
+                        "/bots/{id}/archive",
+                    ),
+                    (Method::GET, "/bots/wallet".to_owned(), "/bots/{id}"),
+                ];
+                for (method, uri, pattern) in &cases {
+                    assert_eq!(
+                        method_matched(build(), method.clone(), uri).await,
+                        (StatusCode::OK, (*pattern).to_owned()),
+                        "{label}: {method} {uri}"
+                    );
+                }
+                for (method, uri) in [
+                    (Method::GET, format!("/bots/{id}/wallet/funding")),
+                    (Method::POST, format!("/bots/{id}/wallet/funding/{funding}")),
+                    (
+                        Method::GET,
+                        format!("/bots/{id}/wallet/funding/{funding}/x"),
+                    ),
+                    (Method::GET, format!("/bots/{id}/wallet/fund")),
+                    (Method::POST, format!("/bots/{id}/wallet/sweep")),
+                    (Method::GET, format!("/bots/{id}/wallet/locked-rent")),
+                    (Method::POST, format!("/bots/{id}/withdraw")),
+                    (Method::GET, format!("/bots/{id}/archive")),
+                ] {
+                    assert_ne!(
+                        method_matched(build(), method.clone(), &uri).await.0,
+                        StatusCode::OK,
+                        "{label}: {method} {uri}"
+                    );
+                }
+            }
+        }
+
+        /// The trading and Solana relay paths each reach their own pattern,
+        /// and `GET /orders` and `POST /orders` share one path.
+        #[tokio::test]
+        async fn trading_and_solana_paths_reach_their_own_route() {
+            for (label, router) in [
+                ("table order", echo_router(ROUTES.iter())),
+                ("reverse order", echo_router(ROUTES.iter().rev())),
+            ] {
+                let build = || router.clone();
+                for (method, uri) in [
+                    (Method::POST, "/trade/swap"),
+                    (Method::POST, "/trade/swap/prepare"),
+                    (Method::POST, "/trade/swap/complete"),
+                    (Method::POST, "/trade/sell-init/quote"),
+                    (Method::GET, "/orders"),
+                    (Method::POST, "/orders"),
+                    (Method::POST, "/solana/submit"),
+                    (Method::POST, "/solana/rpc"),
+                    (Method::GET, "/solana/blockhash"),
+                ] {
+                    assert_eq!(
+                        method_matched(build(), method.clone(), uri).await,
+                        (StatusCode::OK, uri.to_owned()),
+                        "{label}: {method} {uri}"
+                    );
+                }
+                for (method, uri) in [
+                    (Method::GET, "/trade/swap"),
+                    (Method::POST, "/trade/quote"),
+                    (Method::POST, "/trade/buy"),
+                    (Method::POST, "/trade/swap/extra"),
+                    (Method::POST, "/trade/sell-init"),
+                    (Method::GET, "/solana/submit"),
+                    (Method::POST, "/solana/blockhash"),
+                    (Method::POST, "/solana"),
+                ] {
+                    assert_ne!(
+                        method_matched(build(), method.clone(), uri).await.0,
+                        StatusCode::OK,
+                        "{label}: {method} {uri}"
+                    );
+                }
             }
         }
 

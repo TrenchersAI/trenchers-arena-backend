@@ -19,6 +19,8 @@ const BOT: &str = "1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10";
 const OTHER_BOT: &str = "9f3c2a71-5d4e-4b8a-8c1f-2e6d7a9b0c34";
 const ENTRANT: &str = "5b0e8f0e-2c1d-4a7e-9a55-0d3f3d2b8c11";
 const MINT: &str = "So11111111111111111111111111111111111111112";
+const WALLET: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+const ORDER: &str = "3c9e1f7a-8b2d-4e6f-a1c3-5d7e9f0b2a46";
 const USER_AGENT: &str = concat!("trenchers-arena-backend/", env!("CARGO_PKG_VERSION"));
 
 const PRIVY_BODY: &str = r#"{"privy_token":"privy.token.value","wallet_address":"9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"}"#;
@@ -26,6 +28,9 @@ const REFRESH_BODY: &str = r#"{"token":"session.token.value"}"#;
 const CREATE_BOT_BODY: &str = r#"{"name":"Safe Flipper","config":{"sol_buy_amount_lamports":100000000,"exit_tiers":[{"mult_x":"2","pct_of_position":50,"slippage_override_bps":null}]},"paper_mode":true,"spend_limit_lamports":0,"required_acknowledged":["sol_buy_amount_lamports","exit_tiers"]}"#;
 const CONFIG_BODY: &str = r#"{"config":{"max_hold_secs":600},"required_acknowledged":["max_hold_secs"],"change_note":"Updated in Arena"}"#;
 const ALLOCATE_BODY: &str = r#"{"lamports":100000000}"#;
+const SETTINGS_BODY: &str =
+    r#"{"ui_prefs":{"tradingPresets":{"buy":[{"amount_sol":"0.1","slippage_bps":500}]}}}"#;
+const TOKENS_META_BODY: &str = r#"{"mints":["So11111111111111111111111111111111111111112","EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]}"#;
 const CLONE_KEY: &str = "clone-6a1f9c2e-entrant-5b0e8f0e";
 const CLONE_BODY: &str =
     r#"{"name":"My Opus copy","idempotency_key":"clone-6a1f9c2e-entrant-5b0e8f0e"}"#;
@@ -428,6 +433,62 @@ fn contract() -> Vec<Case> {
             upstream: Upstream::Indexer,
             upstream_path: format!("/terminal/{MINT}/candles?res=15&from=1759600000&to=1759686400"),
         },
+        // Account settings
+        api(M::GET, "/me/settings", "/me/settings".into(), None),
+        api(
+            M::PUT,
+            "/me/settings",
+            "/me/settings?return=minimal".into(),
+            Some(SETTINGS_BODY),
+        ),
+        // Portfolio and trades
+        api(M::GET, "/portfolio", "/portfolio".into(), None),
+        api(
+            M::GET,
+            "/portfolio/holdings",
+            "/portfolio/holdings".into(),
+            None,
+        ),
+        api(
+            M::GET,
+            "/portfolio/realized",
+            "/portfolio/realized".into(),
+            None,
+        ),
+        api(
+            M::GET,
+            "/trades",
+            format!("/trades?mint={MINT}&page_size=100"),
+            None,
+        ),
+        api(
+            M::GET,
+            "/fees/recommendation",
+            "/fees/recommendation".into(),
+            None,
+        ),
+        api(
+            M::GET,
+            "/wallets/{address}/sol-balance",
+            format!("/wallets/{WALLET}/sol-balance"),
+            None,
+        ),
+        api(M::GET, "/bots/wallets", "/bots/wallets".into(), None),
+        // Orders (reads)
+        api(M::GET, "/orders", "/orders".into(), None),
+        api(
+            M::GET,
+            "/orders/{id}/events",
+            format!("/orders/{ORDER}/events"),
+            None,
+        ),
+        // Public
+        api(
+            M::POST,
+            "/public/tokens-meta",
+            "/public/tokens-meta".into(),
+            Some(TOKENS_META_BODY),
+        ),
     ]
 }
 
@@ -1094,6 +1155,73 @@ async fn arena_cache_control_comes_back_as_the_platform_set_it() {
 }
 
 // ---------------------------------------------------------------------------
+// Account, portfolio and public routes
+// ---------------------------------------------------------------------------
+
+/// The app saves settings with `PUT /me/settings?return=minimal`; everything
+/// the platform needs to apply the change arrives as the app sent it.
+#[tokio::test]
+async fn a_settings_save_reaches_the_platform_with_query_body_and_token_intact() {
+    let gateway = Gateway::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"))
+        .mount(&gateway.api)
+        .await;
+    let response = gateway
+        .http
+        .put(gateway.url("/me/settings?return=minimal"))
+        .header("authorization", "Bearer session.jwt")
+        .header("content-type", "application/json")
+        .body(SETTINGS_BODY)
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), r#"{"ok":true}"#);
+
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(received.len(), 1);
+    let got = &received[0];
+    assert_eq!(got.method, Method::PUT);
+    assert_eq!(path_and_query(&got.url), "/me/settings?return=minimal");
+    assert_eq!(got.body, SETTINGS_BODY.as_bytes());
+    assert_eq!(header(got, "content-type"), Some("application/json"));
+    assert_eq!(header(got, "authorization"), Some("Bearer session.jwt"));
+    assert!(gateway.received(Upstream::Indexer).await.is_empty());
+}
+
+/// Token metadata and wallet SOL balances take no token on the platform, and
+/// the gateway forwards them without one.
+#[tokio::test]
+async fn public_token_meta_and_sol_balance_are_forwarded_without_a_token() {
+    let gateway = Gateway::with_ok_upstreams().await;
+    let response = gateway
+        .http
+        .post(gateway.url("/public/tokens-meta"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body(TOKENS_META_BODY)
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let balance = format!("/wallets/{WALLET}/sol-balance");
+    let response = gateway.send(Method::GET, &balance).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = gateway.received(Upstream::Platform).await;
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].method, Method::POST);
+    assert_eq!(path_and_query(&received[0].url), "/public/tokens-meta");
+    assert_eq!(received[0].body, TOKENS_META_BODY.as_bytes());
+    assert_eq!(received[1].method, Method::GET);
+    assert_eq!(path_and_query(&received[1].url), balance);
+    for request in &received {
+        assert_eq!(header(request, "authorization"), None, "{}", request.url);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The allowlist
 // ---------------------------------------------------------------------------
 
@@ -1148,6 +1276,18 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::GET, "/admin/arena/seasons".into()),
         (Method::OPTIONS, "/bots".into()),
         (Method::POST, "/health".into()),
+        // Money and order writes stay closed for now.
+        (Method::POST, "/orders".into()),
+        (Method::DELETE, format!("/orders/{ORDER}")),
+        (Method::POST, "/trade/buy".into()),
+        (Method::POST, format!("/bots/{BOT}/wallet")),
+        // Neighbours of the account and portfolio reads that aren't listed.
+        (Method::GET, format!("/orders/{ORDER}")),
+        (Method::POST, "/me/settings".into()),
+        (Method::GET, "/portfolio/positions".into()),
+        (Method::GET, "/wallets/sol-balances".into()),
+        (Method::GET, format!("/wallets/{WALLET}/scan")),
+        (Method::GET, "/public/tokens-meta".into()),
     ];
     for (method, path) in &cases {
         let response = gateway.send(method.clone(), path).await;
@@ -1168,6 +1308,7 @@ async fn static_bot_segments_are_never_captured_as_a_bot_id() {
         format!("/bots/stats?ids={BOT},{OTHER_BOT}"),
         "/bots/leaderboard".to_owned(),
         "/bots/defaults".to_owned(),
+        "/bots/wallets".to_owned(),
     ];
     for path in &statics {
         let response = gateway.send(Method::GET, path).await;
@@ -1191,6 +1332,7 @@ async fn static_bot_segments_are_never_captured_as_a_bot_id() {
         "/bots/stat",
         "/bots/leaderboards",
         "/bots/default",
+        "/bots/wallet",
     ] {
         let response = gateway.send(Method::GET, path).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
@@ -1248,6 +1390,11 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         (Method::GET, format!("/tokens/{MINT}xy/candles")),
         // 44 base58 characters that decode to 44 bytes, not a 32-byte key.
         (Method::GET, format!("/tokens/{}/candles", "1".repeat(44))),
+        (Method::GET, "/wallets/not-an-address/sol-balance".into()),
+        (Method::GET, format!("/wallets/{WALLET}xy/sol-balance")),
+        (Method::GET, format!("/wallets/{BOT}/sol-balance")),
+        (Method::GET, "/orders/not-a-uuid/events".into()),
+        (Method::GET, format!("/orders/{MINT}/events")),
     ];
     for (method, path) in &cases {
         let response = gateway.send(method.clone(), path).await;
@@ -1275,6 +1422,8 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         "/arena/entrants/..%2F..%2Fadmin%2Farena/transcript".to_owned(),
         format!("/arena/entrants/{ENTRANT}%2F..%2F..%2Fadmin"),
         format!("/bots/{BOT}%2F..%2F..%2Farena/arena-clone"),
+        "/wallets/..%2F..%2Fadmin%2Fsettings/sol-balance".to_owned(),
+        "/orders/%2e%2e/events".to_owned(),
     ];
     for target in &raw_targets {
         let (status, body) = raw_request(&gateway.base, &raw_get(target), b"").await;

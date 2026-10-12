@@ -187,6 +187,23 @@ pub static ROUTES: &[Route] = &[
         upstream: Upstream::Indexer,
         upstream_path: "/terminal/{mint}/candles",
     },
+    // Account settings
+    api(Get, "/me/settings"),
+    api(Put, "/me/settings"),
+    // Portfolio and trades
+    api(Get, "/portfolio"),
+    api(Get, "/portfolio/holdings"),
+    api(Get, "/portfolio/realized"),
+    api(Get, "/trades"),
+    api(Get, "/fees/recommendation"),
+    api(Get, "/wallets/{address}/sol-balance"),
+    // Overlaps `/bots/{id}`; `route_precedence_tests` checks it.
+    api(Get, "/bots/wallets"),
+    // Orders (reads)
+    api(Get, "/orders"),
+    api(Get, "/orders/{id}/events"),
+    // Public
+    api(Post, "/public/tokens-meta"),
 ];
 
 /// Builds the router: the allowed routes, `GET /health`, and a JSON 404 for
@@ -467,6 +484,7 @@ mod tests {
                         "/bots/stats",
                     ),
                     ("/bots/leaderboard", "/bots/leaderboard"),
+                    ("/bots/wallets", "/bots/wallets"),
                 ] {
                     assert_eq!(
                         matched(build(), uri).await,
@@ -480,6 +498,7 @@ mod tests {
                     "/bots/statsx".to_owned(),
                     "/bots/stat".to_owned(),
                     "/bots/leaderboards".to_owned(),
+                    "/bots/wallet".to_owned(),
                 ] {
                     assert_eq!(
                         matched(build(), &uri).await,

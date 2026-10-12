@@ -49,6 +49,17 @@ pub enum GatewayError {
 
     #[error("{upstream} response exceeds {limit} bytes")]
     UpstreamTooLarge { upstream: Upstream, limit: usize },
+
+    /// A streamed route's response headers did not arrive in time. Same
+    /// message as [`GatewayError::UpstreamTimeout`]; the gateway's own timer
+    /// fired, so there is no transport error.
+    #[error("{upstream} did not answer in time")]
+    UpstreamHeadersTimeout { upstream: Upstream },
+
+    /// Every AI stream permit is taken. Answered at once rather than queued:
+    /// a queued request would use up the app's 30s wait for the first byte.
+    #[error("too many AI answers in progress, retry shortly")]
+    StreamsBusy,
 }
 
 impl GatewayError {
@@ -60,7 +71,9 @@ impl GatewayError {
             Self::BodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::UpstreamTimeout { .. }
             | Self::UpstreamUnavailable { .. }
-            | Self::UpstreamTooLarge { .. } => StatusCode::BAD_GATEWAY,
+            | Self::UpstreamTooLarge { .. }
+            | Self::UpstreamHeadersTimeout { .. } => StatusCode::BAD_GATEWAY,
+            Self::StreamsBusy => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -75,6 +88,8 @@ impl GatewayError {
             Self::UpstreamTimeout { .. } => "upstream_timeout",
             Self::UpstreamUnavailable { .. } => "upstream_unavailable",
             Self::UpstreamTooLarge { .. } => "upstream_too_large",
+            Self::UpstreamHeadersTimeout { .. } => "upstream_headers_timeout",
+            Self::StreamsBusy => "streams_busy",
         }
     }
 }
@@ -186,6 +201,9 @@ mod tests {
                 upstream: Upstream::Platform,
                 limit: 10,
             },
+            GatewayError::UpstreamHeadersTimeout {
+                upstream: Upstream::Platform,
+            },
         ] {
             let (status, body) = body_of(error).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -236,6 +254,20 @@ mod tests {
         assert_eq!(
             GatewayError::BodyTimeout.status(),
             StatusCode::REQUEST_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn should_answer_a_full_ai_limit_with_503_upstream() {
+        let (status, body) = body_of(GatewayError::StreamsBusy).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({
+                "error": "too many AI answers in progress, retry shortly",
+                "code": 503,
+                "category": "upstream",
+            })
         );
     }
 }

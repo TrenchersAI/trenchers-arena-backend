@@ -58,6 +58,20 @@ pub enum Limit {
     Arena,
     Indexer,
     Trade,
+    /// AI answers streamed as server-sent events. Not a tower layer: the
+    /// permit has to last until the stream ends, so the proxy takes it and
+    /// the response body holds it. See `StreamLimits`.
+    Ai,
+}
+
+/// How the upstream's answer goes back to the app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Read whole, then sent.
+    Buffered,
+    /// Passed on chunk by chunk when the upstream answers 2xx with
+    /// `text/event-stream`; read whole otherwise.
+    Stream,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +105,7 @@ pub struct Route {
     pub limit: Option<Limit>,
     /// Upstream timeout, used when it is longer than `UPSTREAM_TIMEOUT_MS`.
     pub timeout: Option<Duration>,
+    pub delivery: Delivery,
 }
 
 impl Route {
@@ -154,6 +169,7 @@ const fn api(verb: Verb, path: &'static str) -> Route {
         upstream_path: path,
         limit: None,
         timeout: None,
+        delivery: Delivery::Buffered,
     }
 }
 
@@ -164,6 +180,16 @@ const fn trade(verb: Verb, path: &'static str, timeout: Duration) -> Route {
     Route {
         limit: Some(Limit::Trade),
         timeout: Some(timeout),
+        ..api(verb, path)
+    }
+}
+
+/// A platform API route answered with server-sent events: streamed back as it
+/// arrives, under the AI limit and the stream timeouts in `StreamLimits`.
+const fn stream(verb: Verb, path: &'static str) -> Route {
+    Route {
+        limit: Some(Limit::Ai),
+        delivery: Delivery::Stream,
         ..api(verb, path)
     }
 }
@@ -218,6 +244,7 @@ pub static ROUTES: &[Route] = &[
         upstream_path: "/terminal/{mint}/candles",
         limit: None,
         timeout: None,
+        delivery: Delivery::Buffered,
     },
     // Account settings
     api(Get, "/me/settings"),
@@ -238,6 +265,8 @@ pub static ROUTES: &[Route] = &[
     api(Post, "/public/tokens-meta"),
     // Orders (writes). The app waits 30s for a cancel.
     trade(Delete, "/orders/{id}", Duration::from_secs(35)),
+    // AI, streamed (server-sent events). See "Streaming" in the README.
+    stream(Post, "/bots/{id}/ai/insight/stream"),
 ];
 
 /// Builds the router: the allowed routes, `GET /health`, and a JSON 404 for
@@ -248,6 +277,8 @@ pub fn router(proxy: Proxy) -> Router {
         .merge(limited(group(Limit::Arena), ARENA_CONCURRENCY))
         .merge(limited(group(Limit::Indexer), INDEXER_CONCURRENCY))
         .merge(limited(group(Limit::Trade), TRADE_CONCURRENCY))
+        // The proxy limits these itself, for as long as each stream is open.
+        .merge(group(Limit::Ai))
         // Outside the limits, so health checks never wait behind upstream calls.
         .route("/health", get(health))
         .fallback(not_found)
@@ -399,6 +430,26 @@ mod tests {
                 assert_eq!(route.timeout, None, "{}", route.path);
             }
         }
+    }
+
+    #[test]
+    fn should_stream_only_the_insight_route_under_the_ai_limit() {
+        for route in ROUTES {
+            let insight = route.verb == Post && route.path == "/bots/{id}/ai/insight/stream";
+            let (delivery, ai) = if insight {
+                (Delivery::Stream, true)
+            } else {
+                (Delivery::Buffered, false)
+            };
+            assert_eq!(route.delivery, delivery, "{}", route.path);
+            assert_eq!(route.limit() == Limit::Ai, ai, "{}", route.path);
+        }
+        assert!(
+            ROUTES
+                .iter()
+                .any(|route| route.delivery == Delivery::Stream),
+            "the insight route is listed"
+        );
     }
 
     /// `GET /orders` and `POST /orders` sit in different groups. axum merges
@@ -721,6 +772,49 @@ mod tests {
                     (Method::DELETE, "/orders".to_owned()),
                     (Method::DELETE, format!("/orders/{id}/extra")),
                     (Method::GET, format!("/orders/{id}/events/extra")),
+                ] {
+                    assert_ne!(
+                        method_matched(build(), method.clone(), &uri).await.0,
+                        StatusCode::OK,
+                        "{label}: {method} {uri}"
+                    );
+                }
+            }
+        }
+
+        /// The insight stream sits under `/bots/{id}` with the other per-bot
+        /// routes. It reaches its own pattern in either order, and nothing
+        /// shorter or longer reaches it. A static word in the id position
+        /// (`/bots/stats/...`) matches as an id and is refused by the UUID check.
+        #[tokio::test]
+        async fn the_insight_stream_reaches_its_own_route() {
+            let id = "1b4b1a48-0e19-4a5c-9f5e-7c7a0f2b3d10";
+            for (label, router) in [
+                ("table order", echo_router(ROUTES.iter())),
+                ("reverse order", echo_router(ROUTES.iter().rev())),
+            ] {
+                let build = || router.clone();
+                for uri in [
+                    format!("/bots/{id}/ai/insight/stream"),
+                    "/bots/stats/ai/insight/stream".to_owned(),
+                ] {
+                    assert_eq!(
+                        method_matched(build(), Method::POST, &uri).await,
+                        (StatusCode::OK, "/bots/{id}/ai/insight/stream".to_owned()),
+                        "{label}: {uri}"
+                    );
+                }
+                assert_eq!(
+                    matched(build(), &format!("/bots/{id}")).await,
+                    (StatusCode::OK, "/bots/{id}".to_owned()),
+                    "{label}"
+                );
+                for (method, uri) in [
+                    (Method::GET, format!("/bots/{id}/ai/insight/stream")),
+                    (Method::POST, format!("/bots/{id}/ai/insight")),
+                    (Method::POST, format!("/bots/{id}/ai/chat/stream")),
+                    (Method::POST, format!("/bots/{id}/ai/insight/stream/extra")),
+                    (Method::POST, "/bots/ai/insight/stream".to_owned()),
                 ] {
                     assert_ne!(
                         method_matched(build(), method.clone(), &uri).await.0,

@@ -20,6 +20,36 @@ pub struct Config {
     /// the route sets a longer timeout. Also the limit for reading the
     /// client's request body, on every route.
     pub upstream_timeout: Duration,
+    /// Limits for the streamed route. Fixed, not read from the environment.
+    pub streams: StreamLimits,
+}
+
+/// Limits for a route answered with server-sent events, which the gateway
+/// passes on as they arrive instead of reading them whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamLimits {
+    /// Until the upstream's response headers arrive. Longer than the app's
+    /// 30s, so the app gives up first. On expiry: 502.
+    pub headers_timeout: Duration,
+    /// Longest silence between two chunks. The AI service sends a keep-alive
+    /// every 15s, so this is three missed ones.
+    pub idle_timeout: Duration,
+    /// The whole call, headers and body. An insight is at most five model
+    /// calls of up to 60s each.
+    pub max_duration: Duration,
+    /// Max open streams per replica. Each holds a permit until it ends.
+    pub concurrency: usize,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            headers_timeout: Duration::from_secs(35),
+            idle_timeout: Duration::from_secs(45),
+            max_duration: Duration::from_secs(300),
+            concurrency: 16,
+        }
+    }
 }
 
 /// Messages name the variable but never echo its value, which could hold
@@ -84,6 +114,7 @@ impl Config {
             indexer_api_url,
             port,
             upstream_timeout: Duration::from_millis(timeout_ms),
+            streams: StreamLimits::default(),
         })
     }
 }

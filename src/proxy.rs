@@ -2,6 +2,7 @@
 //! back unchanged.
 
 use std::error::Error as _;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, HttpBody};
@@ -10,11 +11,12 @@ use axum::http::header::{self, HeaderMap, HeaderName};
 use axum::http::Method;
 use axum::response::{IntoResponse, Response};
 use reqwest::Url;
+use tokio::sync::Semaphore;
 
-use crate::config::Config;
+use crate::config::{Config, StreamLimits};
 use crate::error::GatewayError;
-use crate::routes::{Route, Upstream};
-use crate::validate;
+use crate::routes::{Delivery, Route, Upstream};
+use crate::{stream, validate};
 
 /// Same request body limit as the platform API.
 pub const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
@@ -56,6 +58,9 @@ pub struct Proxy {
     /// `UPSTREAM_TIMEOUT_MS`: the request body read, and every upstream call
     /// whose route sets no longer timeout.
     timeout: Duration,
+    streams: StreamLimits,
+    /// The AI limit: one permit per open stream, held by its body.
+    stream_permits: Arc<Semaphore>,
 }
 
 impl Proxy {
@@ -74,6 +79,8 @@ impl Proxy {
             platform: config.platform_api_url.clone(),
             indexer: config.indexer_api_url.clone(),
             timeout: config.upstream_timeout,
+            streams: config.streams,
+            stream_permits: Arc::new(Semaphore::new(config.streams.concurrency)),
         })
     }
 
@@ -162,11 +169,29 @@ impl Proxy {
         url.set_path(&path);
         url.set_query(parts.uri.query());
 
+        let streaming = route.delivery == Delivery::Stream;
+        // Taken without waiting: a queued stream would use up the app's wait
+        // for the first byte. A stream's body holds it until the stream ends.
+        let permit = if streaming {
+            let permit = Arc::clone(&self.stream_permits)
+                .try_acquire_owned()
+                .map_err(|_| GatewayError::StreamsBusy)?;
+            Some(permit)
+        } else {
+            None
+        };
+        // Covers connecting, the response headers and the body. A stream's
+        // headers get a shorter limit below.
+        let timeout = if streaming {
+            self.streams.max_duration
+        } else {
+            self.timeout_for(route)
+        };
+
         let mut upstream = self
             .client
             .request(parts.method.clone(), url)
-            // Covers connecting, the response headers and the body.
-            .timeout(self.timeout_for(route));
+            .timeout(timeout);
         for name in &FORWARDED_REQUEST_HEADERS {
             if name == header::AUTHORIZATION && route.upstream == Upstream::Indexer {
                 continue;
@@ -182,11 +207,27 @@ impl Proxy {
             // mobile HTTP clients do.
             upstream = upstream.header(header::CONTENT_LENGTH, 0);
         }
-        let mut response = upstream
-            .body(body)
-            .send()
-            .await
-            .map_err(|source| upstream_error(route.upstream, source))?;
+        let send = upstream.body(body).send();
+        let sent = if streaming {
+            tokio::time::timeout(self.streams.headers_timeout, send)
+                .await
+                .map_err(|_| GatewayError::UpstreamHeadersTimeout {
+                    upstream: route.upstream,
+                })?
+        } else {
+            send.await
+        };
+        let mut response = sent.map_err(|source| upstream_error(route.upstream, source))?;
+
+        // Anything but an event stream (a 429, a JSON refusal) is read whole,
+        // still holding the permit.
+        let _permit = match permit {
+            Some(permit) if stream::is_event_stream(&response) => {
+                let idle = self.streams.idle_timeout;
+                return Ok(stream::respond(route, response, permit, idle));
+            }
+            permit => permit,
+        };
 
         let status = response.status();
         let mut headers = HeaderMap::new();
@@ -298,7 +339,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::routes::{Limit, Verb};
+    use crate::routes::{Delivery, Limit, Verb};
 
     /// A money route with a short timeout, so tests can run past it.
     static SLOW_TRADE: Route = Route {
@@ -308,6 +349,7 @@ mod tests {
         upstream_path: "/slow",
         limit: Some(Limit::Trade),
         timeout: Some(Duration::from_secs(1)),
+        delivery: Delivery::Buffered,
     };
 
     fn proxy(platform: &str, default: Duration) -> Proxy {

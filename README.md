@@ -311,8 +311,12 @@ lowercases them); anything else is a `400` and nothing is forwarded. While
 `503 {"error":"hood-api is not configured","code":503,"category":"upstream"}` and calls
 nothing.
 
-Live updates come from the hood API's WebSocket (`wss://<hood host>/v2/robinhood/ws`),
-which the app opens directly, like the other sockets.
+Live updates do not go through the gateway or the hood API. They come over the socket
+the app already opens directly, st-ws-server's `/ws` (`EXPO_PUBLIC_WS_URL`): the client
+sends `set_pulse_chains` with `["solana", "robinhood"]` to receive Robinhood board
+frames, and joins a token's room as `robinhood:0x...` (the chain-qualified key, never
+the bare address) for its trades. See `docs/architecture/st-ws.md` section 7a in
+solana-terminal.
 
 ### Route precedence
 

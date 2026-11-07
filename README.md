@@ -289,9 +289,9 @@ forwards both of its HTTP surfaces:
   or the chain RPC is down. `/healthz` is not forwarded.
 - **Trading** (`/hood/...`) goes to the platform API (`st-api/src/hood/`, behind
   `require_auth` and the `hood_trading` user flag). The quote and the swap are money
-  routes. **These four routes are listed from the design (section 11) and not built
-  yet**: until st-api ships them, the platform answers `404`. Check their paths and
-  bodies against st-api when it does.
+  routes. **st-api does not serve these five routes yet**: they are built on the
+  solana-terminal `lane/trade-routes` branch, not yet merged into `robinhood`, and until
+  they ship the platform answers `404`.
 
 `{token}` and `{wallet}` must be `0x` and 40 hex digits, in any case (the hood API
 lowercases them); anything else is a `400` and nothing is forwarded. While

@@ -674,6 +674,12 @@ fn contract() -> Vec<Case> {
         ),
         // Robinhood Chain trading (platform API)
         api(
+            M::GET,
+            "/hood/trade/availability",
+            format!("/hood/trade/availability?token={EVM_TOKEN}"),
+            None,
+        ),
+        api(
             M::POST,
             "/hood/wallets/register",
             "/hood/wallets/register".into(),

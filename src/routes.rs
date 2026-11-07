@@ -948,6 +948,11 @@ mod tests {
                 let build = || router.clone();
                 let mut cases = vec![
                     (
+                        Method::GET,
+                        "/hood/trade/availability".to_owned(),
+                        "/hood/trade/availability",
+                    ),
+                    (
                         Method::POST,
                         "/hood/wallets/register".to_owned(),
                         "/hood/wallets/register",
@@ -1044,6 +1049,8 @@ mod tests {
                     (Method::POST, "/hood/trade/orders".to_owned()),
                     (Method::DELETE, format!("/hood/trade/orders/{order}")),
                     (Method::GET, "/hood/wallets/register".to_owned()),
+                    (Method::POST, "/hood/trade/availability".to_owned()),
+                    (Method::GET, "/hood/trade".to_owned()),
                 ] {
                     assert_ne!(
                         method_matched(build(), method.clone(), &uri).await.0,

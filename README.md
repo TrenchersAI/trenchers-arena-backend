@@ -291,7 +291,19 @@ forwards both of its HTTP surfaces:
   `require_auth` and the `hood_trading` user flag). The quote and the swap are money
   routes. **st-api does not serve these five routes yet**: they are built on the
   solana-terminal `lane/trade-routes` branch, not yet merged into `robinhood`, and until
-  they ship the platform answers `404`.
+  they ship the platform answers `404`. What they take, from that branch:
+  - `GET /hood/trade/availability?token=0x...`: whether the user can trade the token
+    now, with a typed `reason` when not, and the limits (`max_trade_wei`,
+    `max_slippage_bps`, `decimals`, `snipe_tax_bps`, `sell_enabled`).
+  - `POST /hood/trade/quote`: `{ token, side, amount_raw, slippage_bps }`. Writes nothing.
+  - `POST /hood/trade/swap`: the quote body plus `client_order_id`; answers `202` with
+    `order_id`. A repeated `client_order_id` with the same trade returns the same order,
+    so a retry after a timeout is safe.
+  - `GET /hood/trade/orders/{id}`: one of the user's orders (`404` for anyone else's).
+  - `POST /hood/wallets/register`: `{ wallet, active }`, the user's Privy EVM wallet.
+
+  Their errors are `{ "error": <code>, "message": ... }`, with codes such as `paused`,
+  `not_allowed`, `cap_exceeded`, `sell_unverified` and `wallet_busy`.
 
 `{token}` and `{wallet}` must be `0x` and 40 hex digits, in any case (the hood API
 lowercases them); anything else is a `400` and nothing is forwarded. While

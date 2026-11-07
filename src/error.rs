@@ -60,6 +60,11 @@ pub enum GatewayError {
     /// a queued request would use up the app's 30s wait for the first byte.
     #[error("too many AI answers in progress, retry shortly")]
     StreamsBusy,
+
+    /// The route's upstream URL is not set (`HOOD_API_URL`), so nothing was
+    /// forwarded.
+    #[error("{upstream} is not configured")]
+    UpstreamNotConfigured { upstream: Upstream },
 }
 
 impl GatewayError {
@@ -73,7 +78,9 @@ impl GatewayError {
             | Self::UpstreamUnavailable { .. }
             | Self::UpstreamTooLarge { .. }
             | Self::UpstreamHeadersTimeout { .. } => StatusCode::BAD_GATEWAY,
-            Self::StreamsBusy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::StreamsBusy | Self::UpstreamNotConfigured { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -90,6 +97,7 @@ impl GatewayError {
             Self::UpstreamTooLarge { .. } => "upstream_too_large",
             Self::UpstreamHeadersTimeout { .. } => "upstream_headers_timeout",
             Self::StreamsBusy => "streams_busy",
+            Self::UpstreamNotConfigured { .. } => "upstream_not_configured",
         }
     }
 }
@@ -265,6 +273,23 @@ mod tests {
             body,
             json!({
                 "error": "too many AI answers in progress, retry shortly",
+                "code": 503,
+                "category": "upstream",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn should_answer_an_unset_upstream_with_503_upstream() {
+        let (status, body) = body_of(GatewayError::UpstreamNotConfigured {
+            upstream: Upstream::Hood,
+        })
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({
+                "error": "hood-api is not configured",
                 "code": 503,
                 "category": "upstream",
             })

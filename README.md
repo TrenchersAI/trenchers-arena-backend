@@ -1,7 +1,8 @@
 # trenchers-arena-backend
 
 Backend for the Trenchers Arena mobile app. It is a small HTTP gateway (Rust, axum)
-that forwards an allowlist of routes to the platform API and refuses everything else:
+that forwards an allowlist of routes to the platform API and the Robinhood Chain read
+API, and refuses everything else:
 
 ```text
 Arena app
@@ -9,12 +10,17 @@ Arena app
    v
 trenchers-arena-backend  (this repo)
    |
-   '-- auth, bots, arena, trading --> platform API  (PLATFORM_API_URL)
+   |-- auth, bots, arena, trading,
+   |   Robinhood Chain trading (/hood/*) --> platform API  (PLATFORM_API_URL)
+   '-- Robinhood Chain market data
+       (/robinhood/*)                    --> hood API      (HOOD_API_URL, optional)
 ```
 
-Market data (charts, the pulse feed and the WebSockets) does not go through the gateway;
-the app calls those services directly (see
+Solana market data (charts, the pulse feed) and all WebSockets do not go through the
+gateway; the app calls those services directly (see
 [Pointing the mobile app at the gateway](#pointing-the-mobile-app-at-the-gateway)).
+Robinhood Chain market data does go through it (see
+[Robinhood Chain](#robinhood-chain)).
 
 What the gateway does on every request:
 
@@ -24,12 +30,14 @@ What the gateway does on every request:
    sent upstream.
 3. Forward the request: same method, path and query string, the request body, and only
    the `Authorization`, `Content-Type`, `Accept` and `Idempotency-Key` headers.
+   `Authorization` goes to the platform API only, never to the hood API.
 4. Return the upstream status and body unchanged, with only `Content-Type`,
    `Cache-Control` and `Retry-After` copied back. The one streamed route passes its
    events back as they arrive (see [Streaming](#streaming)).
 
 Each group of routes has its own limit on in-flight requests (`src/routes.rs`): 64 for
-the platform API, 32 for the Arena routes and 16 for the routes that move money. A request over its group's limit waits. The app polls the Arena routes, so slow
+the platform API, 32 for the Arena routes, 32 for the Robinhood Chain reads and 16 for
+the routes that move money. A request over its group's limit waits. The app polls the Arena routes, so slow
 Arena reads fill only their own limit and never make a sign-in or a bot action wait. The
 app's polling (fleet stats every 30s) sits in the platform group, so it never makes a
 swap or an order wait either. The platform's own money group allows 10 in flight and
@@ -103,6 +111,26 @@ Every route goes to the platform API on the same path.
 | POST | `/solana/submit` | platform (money route, 35s) | |
 | POST | `/solana/rpc` | platform | |
 | GET | `/solana/blockhash` | platform | |
+| POST | `/hood/wallets/register` | platform | |
+| POST | `/hood/trade/quote` | platform (money route, 35s) | |
+| POST | `/hood/trade/swap` | platform (money route, 65s) | |
+| GET | `/hood/trade/orders/{id}` | platform | `id`: UUID |
+| GET | `/robinhood/board` | hood | |
+| GET | `/robinhood/pulse` | hood | |
+| GET | `/robinhood/search` | hood | |
+| GET | `/robinhood/tokens/{token}` | hood | `token`: EVM address |
+| GET | `/robinhood/tokens/{token}/trades` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/candles` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/marks` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/holders` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/dev-tokens` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/status` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/top-traders` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/trades` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/overview` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/open` | hood | `token`: EVM address |
+| GET | `/robinhood/terminal/{token}/funding` | hood | `token`: EVM address |
+| GET | `/robinhood/wallets/{wallet}/balances` | hood | `wallet`: EVM address |
 
 `/fees/recommendation`, `/wallets/{address}/sol-balance` and `/public/tokens-meta` take
 no token on the platform; the others need one. `/public/tokens-meta` takes a JSON body
@@ -144,8 +172,8 @@ in `src/routes.rs`. Each one gets:
 
 | Route | Gateway timeout | App timeout |
 |-------|-----------------|-------------|
-| `POST /trade/swap`, `POST /orders` | 65s | 60s |
-| `DELETE /orders/{id}`, `POST /trade/swap/prepare`, `/trade/swap/complete`, `/trade/sell-init/quote`, `POST /solana/submit` | 35s | 30s |
+| `POST /trade/swap`, `POST /orders`, `POST /hood/trade/swap` | 65s | 60s |
+| `DELETE /orders/{id}`, `POST /trade/swap/prepare`, `/trade/swap/complete`, `/trade/sell-init/quote`, `POST /solana/submit`, `POST /hood/trade/quote` | 35s | 30s |
 | `POST /bots/{id}/wallet/fund`, `/bots/{id}/wallet/withdraw` | 20s | 15s (the app's default) |
 
 `/trade/sell-init/quote` moves no money (the platform treats it as a read) but sits in
@@ -243,6 +271,36 @@ There is no Arena websocket; the app polls these routes.
 
 The source for these facts is the platform API (`solana-terminal`, `crates/st-api`).
 
+### Robinhood Chain
+
+Hood v2 (Robinhood Chain, chain 4663) is built on the `robinhood` branch of
+solana-terminal; its design is `docs/architecture/hood-v2.md` there. The gateway
+forwards both of its HTTP surfaces:
+
+- **Market data** (`/robinhood/...`) goes to the hood API, `st-indexerd-evm`'s read
+  role (the `evm-api` deployment), on the same path. These are the paths the web app
+  calls against `VITE_HOOD_API_BASE_URL`, so the app can use them unchanged. They are
+  public reads: the gateway never sends `Authorization` there, and the hood API (and its
+  ingress) does no per-IP rate limiting today, so the shared-IP problem in
+  [Known limit](#known-limit-per-ip-rate-limits-are-shared) does not apply. Its errors
+  come back as it sent them, `{ "error": "..." }`: a `404` for an unknown token or a
+  chain it does not index, a `400` for a bad query value, `502`/`503` when ClickHouse
+  or the chain RPC is down. `/healthz` is not forwarded.
+- **Trading** (`/hood/...`) goes to the platform API (`st-api/src/hood/`, behind
+  `require_auth` and the `hood_trading` user flag). The quote and the swap are money
+  routes. **These four routes are listed from the design (section 11) and not built
+  yet**: until st-api ships them, the platform answers `404`. Check their paths and
+  bodies against st-api when it does.
+
+`{token}` and `{wallet}` must be `0x` and 40 hex digits, in any case (the hood API
+lowercases them); anything else is a `400` and nothing is forwarded. While
+`HOOD_API_URL` is unset, every `/robinhood/...` route answers
+`503 {"error":"hood-api is not configured","code":503,"category":"upstream"}` and calls
+nothing.
+
+Live updates come from the hood API's WebSocket (`wss://<hood host>/v2/robinhood/ws`),
+which the app opens directly, like the other sockets.
+
 ### Route precedence
 
 Some patterns share a prefix: `/bots/stats` (and the other static `/bots/...` reads,
@@ -252,7 +310,8 @@ including `/bots/wallets`) and `/bots/{id}`, `/arena/seasons` and
 `DELETE /orders/{id}` next to `GET /orders/{id}/events`,
 `/bots/{id}/ai/insight/stream` under `/bots/{id}`, `/bots/live-confirm` and
 `/bots/{id}`, and the `/bots/{id}/wallet/...` routes (`fund` next to
-`funding/{funding_id}`). axum matches whole
+`funding/{funding_id}`), and the `/robinhood/tokens/{token}` and
+`/robinhood/terminal/{token}/...` families. axum matches whole
 segments and prefers a static segment over a `{param}`, whatever the order in
 `ROUTES`. The `route_precedence_tests` module in `src/routes.rs` checks this in both
 registration orders.
@@ -261,12 +320,13 @@ registration orders.
 
 1. Add one line to `ROUTES` in `src/routes.rs`: `api(verb, path)`, or
    `trade(verb, path, timeout)` for a route that moves money (see Money routes), and
-   add it to `TRADE_ROUTES` in the unit tests. A route answered with server-sent
+   add it to `TRADE_ROUTES` in the unit tests. A Robinhood Chain read uses
+   `hood(path)`. A route answered with server-sent
    events uses `stream(verb, path)` (see Streaming).
 2. If it has a new `{param}` name, add its check to `src/validate.rs` (a unit test fails
    until you do).
-3. Add a row to `contract()` in `tests/gateway.rs` (a test fails until the two lists
-   match).
+3. Add a row to `contract()` (or `hood_cases()`) in `tests/gateway.rs` (a test fails
+   until the two lists match).
 4. Add it to the table above.
 
 ## Configuration
@@ -276,11 +336,12 @@ Read from environment variables only (`src/config.rs`). See `.env.example`.
 | Variable | Required | Default | Meaning |
 |----------|----------|---------|---------|
 | `PLATFORM_API_URL` | yes | | Platform API origin, `https://host[:port]`. Plain `http` only for localhost. |
+| `HOOD_API_URL` | no | | Robinhood Chain read API origin (`evm-api`), same rules as `PLATFORM_API_URL`. Unset: the `/robinhood/...` routes answer 503. |
 | `PORT` | no | `8080` | Port to listen on. The gateway always binds all interfaces (`0.0.0.0`). |
 | `UPSTREAM_TIMEOUT_MS` | no | `15000` | Used twice: as the limit for reading the client's request body on every route (on expiry: 408), and separately as the default limit for one upstream call, including its response body (on expiry: 502). Money routes set a longer upstream timeout (see Money routes), and this value is their floor. A slow body followed by a slow upstream can take the two limits added up. |
 | `RUST_LOG` | no | `info` | Log filter. |
 
-The URL must be a bare origin: no path, query, fragment or credentials. Do not commit
+Each URL must be a bare origin: no path, query, fragment or credentials. Do not commit
 real service URLs; keep them in `.env` (git-ignored) or the host's settings.
 
 ## Known limit: per-IP rate limits are shared
@@ -339,7 +400,7 @@ EXPO_PUBLIC_API_BASE_URL=https://<gateway host>
 The app then calls `https://<gateway host>/arena/season`, `/auth/privy` and so on, and
 the gateway forwards them.
 
-Market data stays off the gateway. `EXPO_PUBLIC_PULSE_HTTP_URL` (pulse, terminal data
+Solana market data stays off the gateway. `EXPO_PUBLIC_PULSE_HTTP_URL` (pulse, terminal data
 including candles, token images) points straight at the indexer, and `EXPO_PUBLIC_WS_URL`
 and `EXPO_PUBLIC_PULSE_WS_URL` straight at st-ws-server. Leave them as they are: those
 services rate-limit by the real client IP (`CF-Connecting-IP`), and a gateway in between

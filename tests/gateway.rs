@@ -52,7 +52,7 @@ const RPC_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses
 const HOOD_REGISTER_BODY: &str =
     r#"{"wallet":"0x9a3b5c7d1e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b","active":true}"#;
 const HOOD_QUOTE_BODY: &str = r#"{"token":"0x1f9840a85d5af5bf1d1762f925bdaddc4201f984","side":"buy","amount_raw":"10000000000000000","slippage_bps":500}"#;
-const HOOD_SWAP_BODY: &str = r#"{"client_order_id":"hood-7f3a","token":"0x1f9840a85d5af5bf1d1762f925bdaddc4201f984","side":"buy","amount_wei":"10000000000000000","slippage_bps":500}"#;
+const HOOD_SWAP_BODY: &str = r#"{"client_order_id":"hood-7f3a","token":"0x1f9840a85d5af5bf1d1762f925bdaddc4201f984","side":"buy","amount_raw":"10000000000000000","slippage_bps":500}"#;
 const CLONE_KEY: &str = "clone-6a1f9c2e-entrant-5b0e8f0e";
 const CLONE_BODY: &str =
     r#"{"name":"My Opus copy","idempotency_key":"clone-6a1f9c2e-entrant-5b0e8f0e"}"#;

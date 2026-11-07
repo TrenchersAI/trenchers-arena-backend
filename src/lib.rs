@@ -1,5 +1,6 @@
 //! Backend for the Arena mobile app: an HTTP gateway that forwards
-//! the routes in [`routes::ROUTES`] to the platform API.
+//! the routes in [`routes::ROUTES`] to the platform API and the Robinhood
+//! Chain read API.
 
 pub mod config;
 pub mod error;

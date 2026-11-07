@@ -111,6 +111,7 @@ Every route goes to the platform API on the same path.
 | POST | `/solana/submit` | platform (money route, 35s) | |
 | POST | `/solana/rpc` | platform | |
 | GET | `/solana/blockhash` | platform | |
+| GET | `/hood/trade/availability` | platform | |
 | POST | `/hood/wallets/register` | platform | |
 | POST | `/hood/trade/quote` | platform (money route, 35s) | |
 | POST | `/hood/trade/swap` | platform (money route, 65s) | |

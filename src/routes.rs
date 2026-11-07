@@ -30,16 +30,24 @@ const ARENA_CONCURRENCY: usize = 32;
 /// the gateway only holds requests back once the platform is badly backed up.
 const TRADE_CONCURRENCY: usize = 16;
 
+/// Max in-flight Robinhood Chain market data reads. Their own limit, so a slow
+/// chart or board read never delays a platform call.
+const HOOD_CONCURRENCY: usize = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Upstream {
     /// The platform API, at `PLATFORM_API_URL`.
     Platform,
+    /// The Robinhood Chain read API (`st-indexerd-evm`), at `HOOD_API_URL`.
+    /// Public market data; it never reads a session token.
+    Hood,
 }
 
 impl fmt::Display for Upstream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Platform => "platform-api",
+            Self::Hood => "hood-api",
         })
     }
 }
@@ -50,6 +58,8 @@ pub enum Limit {
     Platform,
     Arena,
     Trade,
+    /// Robinhood Chain market data, on the hood API.
+    Hood,
     /// AI answers streamed as server-sent events. Not a tower layer: the
     /// permit has to last until the stream ends, so the proxy takes it and
     /// the response body holds it. See `StreamLimits`.
@@ -107,6 +117,7 @@ impl Route {
         }
         let arena = self.path.starts_with("/arena/") || self.path == "/bots/{id}/arena-clone";
         match self.upstream {
+            Upstream::Hood => Limit::Hood,
             Upstream::Platform if arena => Limit::Arena,
             Upstream::Platform => Limit::Platform,
         }
@@ -157,6 +168,20 @@ const fn api(verb: Verb, path: &'static str) -> Route {
         verb,
         path,
         upstream: Upstream::Platform,
+        upstream_path: path,
+        limit: None,
+        timeout: None,
+        delivery: Delivery::Buffered,
+    }
+}
+
+/// A Robinhood Chain read, forwarded to the hood API on the same path. The
+/// app uses the paths the web app uses against `VITE_HOOD_API_BASE_URL`.
+const fn hood(path: &'static str) -> Route {
+    Route {
+        verb: Get,
+        path,
+        upstream: Upstream::Hood,
         upstream_path: path,
         limit: None,
         timeout: None,
@@ -269,6 +294,25 @@ pub static ROUTES: &[Route] = &[
     trade(Post, "/solana/submit", Duration::from_secs(35)),
     api(Post, "/solana/rpc"),
     api(Get, "/solana/blockhash"),
+    // Robinhood Chain market data, from the hood API (`st-indexerd-evm`).
+    // `{token}` and `{wallet}` are 0x EVM addresses. Live updates come from
+    // its WebSocket, which the app opens directly.
+    hood("/robinhood/board"),
+    hood("/robinhood/pulse"),
+    hood("/robinhood/search"),
+    hood("/robinhood/tokens/{token}"),
+    hood("/robinhood/tokens/{token}/trades"),
+    hood("/robinhood/terminal/{token}/candles"),
+    hood("/robinhood/terminal/{token}/marks"),
+    hood("/robinhood/terminal/{token}/holders"),
+    hood("/robinhood/terminal/{token}/dev-tokens"),
+    hood("/robinhood/terminal/{token}/status"),
+    hood("/robinhood/terminal/{token}/top-traders"),
+    hood("/robinhood/terminal/{token}/trades"),
+    hood("/robinhood/terminal/{token}/overview"),
+    hood("/robinhood/terminal/{token}/open"),
+    hood("/robinhood/terminal/{token}/funding"),
+    hood("/robinhood/wallets/{wallet}/balances"),
 ];
 
 /// Builds the router: the allowed routes, `GET /health`, and a JSON 404 for
@@ -278,6 +322,7 @@ pub fn router(proxy: Proxy) -> Router {
         .merge(limited(group(Limit::Platform), PLATFORM_CONCURRENCY))
         .merge(limited(group(Limit::Arena), ARENA_CONCURRENCY))
         .merge(limited(group(Limit::Trade), TRADE_CONCURRENCY))
+        .merge(limited(group(Limit::Hood), HOOD_CONCURRENCY))
         // The proxy limits these itself, for as long as each stream is open.
         .merge(group(Limit::Ai))
         // Outside the limits, so health checks never wait behind upstream calls.
@@ -560,11 +605,29 @@ mod tests {
     }
 
     #[test]
-    fn should_forward_every_route_to_the_platform_api_on_its_own_path() {
+    fn should_forward_every_route_on_its_own_path() {
         for route in ROUTES {
-            assert_eq!(route.upstream, Upstream::Platform, "{}", route.path);
             assert_eq!(route.upstream_path, route.path, "{}", route.path);
         }
+    }
+
+    /// The `/robinhood/...` reads, and only they, go to the hood API, as GETs
+    /// under the hood limit on the default timeout.
+    #[test]
+    fn should_send_only_the_robinhood_reads_to_the_hood_api() {
+        let mut hood = 0;
+        for route in ROUTES {
+            let read = route.path.starts_with("/robinhood/");
+            assert_eq!(route.upstream == Upstream::Hood, read, "{}", route.path);
+            assert_eq!(route.limit() == Limit::Hood, read, "{}", route.path);
+            if read {
+                hood += 1;
+                assert_eq!(route.verb, Get, "{}", route.path);
+                assert_eq!(route.timeout, None, "{}", route.path);
+                assert_eq!(route.delivery, Delivery::Buffered, "{}", route.path);
+            }
+        }
+        assert_eq!(hood, 16, "every hood API read except /healthz");
     }
 
     #[test]
@@ -832,6 +895,101 @@ mod tests {
                 ] {
                     assert_ne!(
                         method_matched(build(), method.clone(), uri).await.0,
+                        StatusCode::OK,
+                        "{label}: {method} {uri}"
+                    );
+                }
+            }
+        }
+
+        /// The Robinhood Chain paths each reach their own pattern in either
+        /// order: `/robinhood/tokens/{token}` and its trades are distinct, the
+        /// terminal family never swallows a longer path.
+        #[tokio::test]
+        async fn robinhood_paths_reach_their_own_route() {
+            let token = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984";
+            for (label, router) in [
+                ("table order", echo_router(ROUTES.iter())),
+                ("reverse order", echo_router(ROUTES.iter().rev())),
+            ] {
+                let build = || router.clone();
+                let mut cases = vec![
+                    (
+                        Method::GET,
+                        "/robinhood/board".to_owned(),
+                        "/robinhood/board",
+                    ),
+                    (
+                        Method::GET,
+                        "/robinhood/pulse".to_owned(),
+                        "/robinhood/pulse",
+                    ),
+                    (
+                        Method::GET,
+                        "/robinhood/search".to_owned(),
+                        "/robinhood/search",
+                    ),
+                    (
+                        Method::GET,
+                        format!("/robinhood/tokens/{token}"),
+                        "/robinhood/tokens/{token}",
+                    ),
+                    (
+                        Method::GET,
+                        format!("/robinhood/tokens/{token}/trades"),
+                        "/robinhood/tokens/{token}/trades",
+                    ),
+                    (
+                        Method::GET,
+                        format!("/robinhood/wallets/{token}/balances"),
+                        "/robinhood/wallets/{wallet}/balances",
+                    ),
+                ];
+                for leaf in [
+                    "candles",
+                    "marks",
+                    "holders",
+                    "dev-tokens",
+                    "status",
+                    "top-traders",
+                    "trades",
+                    "overview",
+                    "open",
+                    "funding",
+                ] {
+                    let uri = format!("/robinhood/terminal/{token}/{leaf}");
+                    let pattern: &'static str = ROUTES
+                        .iter()
+                        .find(|route| {
+                            route.path.ends_with(&format!("/{{token}}/{leaf}"))
+                                && route.path.starts_with("/robinhood/terminal/")
+                        })
+                        .expect("listed")
+                        .path;
+                    cases.push((Method::GET, uri, pattern));
+                }
+                for (method, uri, pattern) in &cases {
+                    assert_eq!(
+                        method_matched(build(), method.clone(), uri).await,
+                        (StatusCode::OK, (*pattern).to_owned()),
+                        "{label}: {method} {uri}"
+                    );
+                }
+                for (method, uri) in [
+                    (Method::GET, "/robinhood".to_owned()),
+                    (Method::GET, "/robinhood/healthz".to_owned()),
+                    (Method::GET, "/base/pulse".to_owned()),
+                    (Method::POST, "/robinhood/pulse".to_owned()),
+                    (Method::GET, format!("/robinhood/terminal/{token}")),
+                    (
+                        Method::GET,
+                        format!("/robinhood/terminal/{token}/candles/extra"),
+                    ),
+                    (Method::GET, format!("/robinhood/tokens/{token}/holders")),
+                    (Method::GET, format!("/robinhood/wallets/{token}")),
+                ] {
+                    assert_ne!(
+                        method_matched(build(), method.clone(), &uri).await.0,
                         StatusCode::OK,
                         "{label}: {method} {uri}"
                     );

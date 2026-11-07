@@ -1,5 +1,5 @@
 //! Configuration from environment variables. The platform API URL is
-//! required; the other settings have defaults.
+//! required; the hood API URL is optional; the other settings have defaults.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -13,6 +13,9 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 15_000;
 pub struct Config {
     /// The platform API: auth, bots, arena, leaderboard.
     pub platform_api_url: Url,
+    /// The Robinhood Chain read API (`st-indexerd-evm`). Optional: while it is
+    /// unset, the `/robinhood/...` routes answer 503 and call nothing.
+    pub hood_api_url: Option<Url>,
     pub port: u16,
     /// One upstream call, from connect until its whole body is read, unless
     /// the route sets a longer timeout. Also the limit for reading the
@@ -90,6 +93,9 @@ impl Config {
         };
         let required = |name: &'static str| var(name).ok_or(ConfigError::Missing { var: name });
         let platform_api_url = upstream_url("PLATFORM_API_URL", &required("PLATFORM_API_URL")?)?;
+        let hood_api_url = var("HOOD_API_URL")
+            .map(|raw| upstream_url("HOOD_API_URL", &raw))
+            .transpose()?;
         let port = match var("PORT") {
             None => DEFAULT_PORT,
             Some(raw) => raw
@@ -108,6 +114,7 @@ impl Config {
         };
         Ok(Self {
             platform_api_url,
+            hood_api_url,
             port,
             upstream_timeout: Duration::from_millis(timeout_ms),
             streams: StreamLimits::default(),
@@ -176,8 +183,37 @@ mod tests {
             config.platform_api_url.as_str(),
             "https://platform.example.com/"
         );
+        assert_eq!(config.hood_api_url, None);
         assert_eq!(config.port, 8080);
         assert_eq!(config.upstream_timeout, Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn should_read_an_optional_hood_api_url_with_the_same_rules() {
+        let hood = |raw: &str| config(&[("HOOD_API_URL", raw)]);
+        assert_eq!(
+            hood("https://hood.example.net")
+                .expect("valid")
+                .hood_api_url
+                .map(String::from),
+            Some("https://hood.example.net/".to_owned())
+        );
+        for blank in ["", "  "] {
+            let unset = hood(blank).expect("blank is unset").hood_api_url;
+            assert_eq!(unset, None, "{blank:?}");
+        }
+        assert!(hood("http://127.0.0.1:8791").is_ok(), "local http");
+        let var = "HOOD_API_URL";
+        for (raw, error) in [
+            ("http://hood.example.net", ConfigError::InsecureUrl { var }),
+            (
+                "https://hood.example.net/robinhood",
+                ConfigError::NotAnOrigin { var },
+            ),
+            ("hood.example.net", ConfigError::InvalidUrl { var }),
+        ] {
+            assert_eq!(hood(raw).expect_err(raw), error, "{raw}");
+        }
     }
 
     #[test]

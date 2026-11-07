@@ -13,6 +13,7 @@ pub fn path_param(name: &'static str, raw: &str) -> Result<(), GatewayError> {
         "funding_id" => (is_uuid(raw), "a UUID"),
         "address" => (is_base58_address(raw), "a base58 Solana address"),
         "number" => (is_season_number(raw), "a season number"),
+        "token" | "wallet" => (is_evm_address(raw), "a 0x-prefixed 20-byte EVM address"),
         _ => (false, "a known parameter"),
     };
     if valid {
@@ -24,7 +25,10 @@ pub fn path_param(name: &'static str, raw: &str) -> Result<(), GatewayError> {
 
 /// Whether `name` has a check in [`path_param`].
 pub fn is_known(name: &str) -> bool {
-    matches!(name, "id" | "funding_id" | "number" | "address")
+    matches!(
+        name,
+        "id" | "funding_id" | "number" | "address" | "token" | "wallet"
+    )
 }
 
 /// Bot, entrant, order and bot wallet funding ids, in any form the `uuid`
@@ -37,6 +41,13 @@ pub fn is_uuid(raw: &str) -> bool {
 pub fn is_base58_address(raw: &str) -> bool {
     (32..=44).contains(&raw.len())
         && matches!(bs58::decode(raw).into_vec(), Ok(bytes) if bytes.len() == 32)
+}
+
+/// A Robinhood Chain (EVM) token or wallet address: `0x` and 40 hex digits,
+/// in any case. The hood API lowercases it.
+pub fn is_evm_address(raw: &str) -> bool {
+    raw.strip_prefix("0x")
+        .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Arena season numbers (32-bit integers).
@@ -113,6 +124,38 @@ mod tests {
     }
 
     #[test]
+    fn should_accept_evm_addresses_in_any_case() {
+        for raw in [
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+            "0x1F9840a85d5aF5bf1D1762F925BDADdC4201F984",
+            "0x0000000000000000000000000000000000000000",
+        ] {
+            assert!(is_evm_address(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn should_reject_anything_that_is_not_an_evm_address() {
+        for raw in [
+            "",
+            "0x",
+            "1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+            "0X1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f98",
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f9840",
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f98g",
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f9%34",
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984%2F..",
+            " 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+            "So11111111111111111111111111111111111111112",
+            "..",
+            "%2e%2e",
+        ] {
+            assert!(!is_evm_address(raw), "{raw:?}");
+        }
+    }
+
+    #[test]
     fn should_accept_season_numbers_and_nothing_else() {
         for raw in ["1", "6", "2147483647"] {
             assert!(is_season_number(raw), "{raw}");
@@ -124,12 +167,12 @@ mod tests {
 
     #[test]
     fn should_fail_closed_on_a_parameter_without_a_check() {
-        let error = path_param("wallet", "anything").expect_err("unknown name");
+        let error = path_param("chain", "robinhood").expect_err("unknown name");
         assert!(matches!(
             error,
-            GatewayError::InvalidPathParam { name: "wallet", .. }
+            GatewayError::InvalidPathParam { name: "chain", .. }
         ));
-        assert!(!is_known("wallet"));
+        assert!(!is_known("chain"));
         assert!(path_param("mint", "So11111111111111111111111111111111111111112").is_err());
         assert!(!is_known("mint"));
     }
@@ -179,7 +222,11 @@ mod tests {
         assert!(path_param("address", "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl").is_err());
         assert!(path_param("address", "..").is_err());
         assert!(path_param("address", &"1".repeat(44)).is_err());
-        for name in ["id", "funding_id", "number", "address"] {
+        assert!(path_param("token", "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984").is_ok());
+        assert!(path_param("wallet", "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984").is_ok());
+        assert!(path_param("token", "So11111111111111111111111111111111111111112").is_err());
+        assert!(path_param("wallet", "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").is_err());
+        for name in ["id", "funding_id", "number", "address", "token", "wallet"] {
             assert!(is_known(name), "{name}");
         }
     }

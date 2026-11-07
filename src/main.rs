@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         %addr,
         platform_api = %config.platform_api_url,
+        hood_api = config.hood_api_url.as_ref().map_or("unset", |url| url.as_str()),
         upstream_timeout_ms = config.upstream_timeout.as_millis(),
         version = env!("CARGO_PKG_VERSION"),
         "trenchers-arena-backend listening"

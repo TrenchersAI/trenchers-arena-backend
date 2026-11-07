@@ -30,6 +30,10 @@ pub const USER_AGENT: &str = concat!("trenchers-arena-backend/", env!("CARGO_PKG
 /// cookies and client-supplied `X-Forwarded-*` / `CF-*` headers, which the
 /// platform API would treat as the client's address.
 ///
+/// `Authorization` goes to the platform API only. The hood API serves public
+/// market data and never reads it, so a session token has no reason to go
+/// there.
+///
 /// reqwest adds `Host`, `User-Agent` and `Content-Length`, plus `Accept: */*`
 /// when the client sent no `Accept`.
 pub static FORWARDED_REQUEST_HEADERS: [HeaderName; 4] = [
@@ -51,6 +55,7 @@ pub static RETURNED_RESPONSE_HEADERS: [HeaderName; 3] = [
 pub struct Proxy {
     client: reqwest::Client,
     platform: Url,
+    hood: Option<Url>,
     /// `UPSTREAM_TIMEOUT_MS`: the request body read, and every upstream call
     /// whose route sets no longer timeout.
     timeout: Duration,
@@ -73,6 +78,7 @@ impl Proxy {
         Ok(Self {
             client,
             platform: config.platform_api_url.clone(),
+            hood: config.hood_api_url.clone(),
             timeout: config.upstream_timeout,
             streams: config.streams,
             stream_permits: Arc::new(Semaphore::new(config.streams.concurrency)),
@@ -153,11 +159,17 @@ impl Proxy {
             validate::path_param(name, raw)?;
         }
         let path = route.upstream_path_for(&params).ok_or_else(not_found)?;
-        let body = self.read_body(&parts.headers, body).await?;
-
         let mut url = match route.upstream {
             Upstream::Platform => self.platform.clone(),
+            Upstream::Hood => self
+                .hood
+                .clone()
+                .ok_or(GatewayError::UpstreamNotConfigured {
+                    upstream: Upstream::Hood,
+                })?,
         };
+        let body = self.read_body(&parts.headers, body).await?;
+
         // set_query may percent-encode a few bytes (a raw `'`, for example);
         // they decode to the same value.
         url.set_path(&path);
@@ -187,6 +199,9 @@ impl Proxy {
             .request(parts.method.clone(), url)
             .timeout(timeout);
         for name in &FORWARDED_REQUEST_HEADERS {
+            if name == header::AUTHORIZATION && route.upstream == Upstream::Hood {
+                continue;
+            }
             for value in parts.headers.get_all(name) {
                 let mut value = value.clone();
                 value.set_sensitive(name == header::AUTHORIZATION);

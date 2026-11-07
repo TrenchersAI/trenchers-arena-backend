@@ -1,5 +1,6 @@
-//! Integration tests: the gateway on a local port in front of a wiremock
-//! server standing in for the platform API, checking what it receives.
+//! Integration tests: the gateway on a local port in front of two wiremock
+//! servers standing in for the platform API and the hood API, checking what
+//! they receive.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -22,6 +23,9 @@ const MINT: &str = "So11111111111111111111111111111111111111112";
 const WALLET: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
 const ORDER: &str = "3c9e1f7a-8b2d-4e6f-a1c3-5d7e9f0b2a46";
 const FUNDING: &str = "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2f";
+/// A Robinhood Chain token and wallet, as the app sends them (checksummed).
+const EVM_TOKEN: &str = "0x1F9840a85d5aF5bf1D1762F925BDADdC4201F984";
+const EVM_WALLET: &str = "0x9a3B5c7D1e2F4a6b8C0d2E4f6A8b0C2d4E6f8A0b";
 const USER_AGENT: &str = concat!("trenchers-arena-backend/", env!("CARGO_PKG_VERSION"));
 
 const PRIVY_BODY: &str = r#"{"privy_token":"privy.token.value","wallet_address":"9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"}"#;
@@ -59,6 +63,7 @@ const FEED_CURSOR: &str =
 struct Gateway {
     base: String,
     api: MockServer,
+    hood: MockServer,
     http: reqwest::Client,
 }
 
@@ -69,23 +74,27 @@ impl Gateway {
 
     async fn start_with_timeout(timeout: Duration) -> Self {
         let api = MockServer::start().await;
-        let base = serve(&api.uri(), timeout).await;
+        let hood = MockServer::start().await;
+        let base = serve(&api.uri(), Some(&hood.uri()), timeout).await;
         Self {
             base,
             api,
+            hood,
             http: test_client(),
         }
     }
 
-    /// The platform API answers every request with `200 {"ok":true}`.
+    /// Both upstreams answer every request with `200 {"ok":true}`.
     async fn with_ok_upstream() -> Self {
         let gateway = Self::start().await;
-        Mock::given(any())
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"),
-            )
-            .mount(&gateway.api)
-            .await;
+        for server in [&gateway.api, &gateway.hood] {
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"),
+                )
+                .mount(server)
+                .await;
+        }
         gateway
     }
 
@@ -121,25 +130,46 @@ impl Gateway {
             .expect("request recording is on")
     }
 
+    /// What the hood API has received so far.
+    async fn hood_received(&self) -> Vec<Request> {
+        self.hood
+            .received_requests()
+            .await
+            .expect("request recording is on")
+    }
+
+    /// What `upstream` has received so far.
+    async fn received_by(&self, upstream: Upstream) -> Vec<Request> {
+        match upstream {
+            Upstream::Platform => self.received().await,
+            Upstream::Hood => self.hood_received().await,
+        }
+    }
+
     async fn assert_no_upstream_calls(&self) {
-        let received = self.received().await;
-        assert!(
-            received.is_empty(),
-            "the platform API must not be called, but received: {:?}",
-            received
-                .iter()
-                .map(|r| format!("{} {}", r.method, r.url))
-                .collect::<Vec<_>>()
-        );
+        for upstream in [Upstream::Platform, Upstream::Hood] {
+            let received = self.received_by(upstream).await;
+            assert!(
+                received.is_empty(),
+                "{upstream} must not be called, but received: {:?}",
+                received
+                    .iter()
+                    .map(|r| format!("{} {}", r.method, r.url))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
 
 /// Serves the gateway on an ephemeral port and returns its base URL.
-async fn serve(api: &str, timeout: Duration) -> String {
-    let vars = HashMap::from([
+async fn serve(api: &str, hood: Option<&str>, timeout: Duration) -> String {
+    let mut vars = HashMap::from([
         ("PLATFORM_API_URL", api.to_owned()),
         ("UPSTREAM_TIMEOUT_MS", timeout.as_millis().to_string()),
     ]);
+    if let Some(hood) = hood {
+        vars.insert("HOOD_API_URL", hood.to_owned());
+    }
     let config = Config::from_lookup(|name| vars.get(name).cloned()).expect("test config is valid");
     let router = app(&config).expect("the gateway builds");
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -264,6 +294,63 @@ fn api(method: Method, pattern: &'static str, path: String, body: Option<&'stati
         body,
         upstream: Upstream::Platform,
     }
+}
+
+/// A Robinhood Chain read, forwarded to the hood API on the same path.
+fn hood(pattern: &'static str, path: String) -> Case {
+    Case {
+        upstream: Upstream::Hood,
+        ..api(Method::GET, pattern, path, None)
+    }
+}
+
+/// The Robinhood Chain reads, with query strings like the web app's.
+fn hood_cases() -> Vec<Case> {
+    let t = EVM_TOKEN;
+    let mut cases = vec![
+        hood("/robinhood/board", "/robinhood/board?limit=50".into()),
+        hood(
+            "/robinhood/pulse",
+            "/robinhood/pulse?view=new&limit=100".into(),
+        ),
+        hood(
+            "/robinhood/search",
+            "/robinhood/search?q=pons&limit=20".into(),
+        ),
+        hood(
+            "/robinhood/tokens/{token}",
+            format!("/robinhood/tokens/{t}"),
+        ),
+        hood(
+            "/robinhood/tokens/{token}/trades",
+            format!("/robinhood/tokens/{t}/trades?limit=200"),
+        ),
+        hood(
+            "/robinhood/terminal/{token}/candles",
+            format!("/robinhood/terminal/{t}/candles?res=1m&from=1730190000&to=1730193600"),
+        ),
+        hood(
+            "/robinhood/terminal/{token}/trades",
+            format!("/robinhood/terminal/{t}/trades?trader={EVM_WALLET}&limit=50"),
+        ),
+        hood(
+            "/robinhood/wallets/{wallet}/balances",
+            format!("/robinhood/wallets/{EVM_WALLET}/balances"),
+        ),
+    ];
+    for (pattern, leaf) in [
+        ("/robinhood/terminal/{token}/marks", "marks"),
+        ("/robinhood/terminal/{token}/holders", "holders"),
+        ("/robinhood/terminal/{token}/dev-tokens", "dev-tokens"),
+        ("/robinhood/terminal/{token}/status", "status"),
+        ("/robinhood/terminal/{token}/top-traders", "top-traders"),
+        ("/robinhood/terminal/{token}/overview", "overview"),
+        ("/robinhood/terminal/{token}/open", "open"),
+        ("/robinhood/terminal/{token}/funding", "funding"),
+    ] {
+        cases.push(hood(pattern, format!("/robinhood/terminal/{t}/{leaf}")));
+    }
+    cases
 }
 
 fn contract() -> Vec<Case> {
@@ -581,6 +668,9 @@ fn contract() -> Vec<Case> {
             None,
         ),
     ]
+    .into_iter()
+    .chain(hood_cases())
+    .collect()
 }
 
 #[test]
@@ -603,7 +693,12 @@ async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact
     let gateway = Gateway::with_ok_upstream().await;
     for case in contract() {
         let label = format!("{} {}", case.method, case.path);
-        let before = gateway.received().await.len();
+        let before = gateway.received_by(case.upstream).await.len();
+        let other = match case.upstream {
+            Upstream::Platform => Upstream::Hood,
+            Upstream::Hood => Upstream::Platform,
+        };
+        let other_before = gateway.received_by(other).await.len();
 
         let mut request = gateway
             .http
@@ -623,8 +718,13 @@ async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact
             "{label}"
         );
 
-        let received = gateway.received().await;
+        let received = gateway.received_by(case.upstream).await;
         let hit = &received[before..];
+        assert_eq!(
+            gateway.received_by(other).await.len(),
+            other_before,
+            "{label}: {other} is not called"
+        );
         assert_eq!(
             hit.len(),
             1,
@@ -643,9 +743,14 @@ async fn every_route_reaches_its_upstream_with_method_path_query_and_body_intact
             case.body.unwrap_or_default().as_bytes(),
             "{label}: body"
         );
+        // The hood API serves public data; a session token never goes there.
+        let token = match case.upstream {
+            Upstream::Platform => Some("Bearer session.jwt"),
+            Upstream::Hood => None,
+        };
         assert_eq!(
             header(got, "authorization"),
-            Some("Bearer session.jwt"),
+            token,
             "{label}: authorization"
         );
     }
@@ -1429,6 +1534,26 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::GET, "/wallets/sol-balances".into()),
         (Method::GET, format!("/wallets/{WALLET}/scan")),
         (Method::GET, "/public/tokens-meta".into()),
+        // Robinhood Chain: the hood API's health route, other chains, other
+        // methods, and paths that only look like listed ones.
+        (Method::GET, "/robinhood".into()),
+        (Method::GET, "/robinhood/healthz".into()),
+        (Method::GET, "/healthz".into()),
+        (Method::GET, "/base/pulse".into()),
+        (Method::GET, "/v2/robinhood/pulse".into()),
+        (Method::GET, "/robinhood/ws".into()),
+        (Method::POST, "/robinhood/pulse".into()),
+        (Method::DELETE, format!("/robinhood/tokens/{EVM_TOKEN}")),
+        (Method::GET, format!("/robinhood/terminal/{EVM_TOKEN}")),
+        (
+            Method::GET,
+            format!("/robinhood/terminal/{EVM_TOKEN}/candles/extra"),
+        ),
+        (
+            Method::GET,
+            format!("/robinhood/tokens/{EVM_TOKEN}/holders"),
+        ),
+        (Method::GET, format!("/robinhood/wallets/{EVM_WALLET}")),
     ];
     for (method, path) in &cases {
         let response = gateway.send(method.clone(), path).await;
@@ -1549,6 +1674,27 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         ),
         // A near miss of `/bots/live-confirm` is a bot id.
         (Method::POST, "/bots/live-confirm/archive".into()),
+        // Robinhood Chain: a token or wallet must be a 0x EVM address, and a
+        // hood order id a UUID.
+        (Method::GET, format!("/robinhood/tokens/{MINT}")),
+        (Method::GET, "/robinhood/tokens/pons".into()),
+        (
+            Method::GET,
+            format!("/robinhood/tokens/{}", &EVM_TOKEN[2..]),
+        ),
+        (
+            Method::GET,
+            format!("/robinhood/tokens/{EVM_TOKEN}0/trades"),
+        ),
+        (
+            Method::GET,
+            format!("/robinhood/terminal/{}/candles", &EVM_TOKEN[..41]),
+        ),
+        (
+            Method::GET,
+            "/robinhood/terminal/0xZZ9840a85d5aF5bf1D1762F925BDADdC4201F984/holders".into(),
+        ),
+        (Method::GET, format!("/robinhood/wallets/{WALLET}/balances")),
     ];
     for (method, path) in &cases {
         let response = gateway.send(method.clone(), path).await;
@@ -1579,6 +1725,10 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         "/orders/%2e%2e/events".to_owned(),
         format!("/bots/{BOT}/wallet/funding/%2e%2e"),
         format!("/bots/{BOT}/wallet/funding/..%2F..%2Fwallet"),
+        "/robinhood/tokens/..".to_owned(),
+        "/robinhood/tokens/%2e%2e/trades".to_owned(),
+        format!("/robinhood/terminal/{EVM_TOKEN}%2F..%2F..%2Fhealthz/status"),
+        "/robinhood/wallets/..%2F..%2Fhealthz/balances".to_owned(),
     ];
     for target in &raw_targets {
         let (status, body) = raw_request(&gateway.base, &raw_get(target), b"").await;
@@ -1700,7 +1850,7 @@ async fn a_body_over_the_limit_answers_413_without_reaching_the_upstream() {
 
 #[tokio::test]
 async fn an_unreachable_upstream_answers_502_in_the_error_shape() {
-    let base = serve(&closed_port_url().await, Duration::from_secs(2)).await;
+    let base = serve(&closed_port_url().await, None, Duration::from_secs(2)).await;
     let response = test_client()
         .get(format!("{base}/me"))
         .send()
@@ -2040,4 +2190,147 @@ async fn a_missing_bot_wallet_404_passes_through_unchanged() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.expect("body"), body);
     assert_eq!(gateway.received().await.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Robinhood Chain
+// ---------------------------------------------------------------------------
+
+/// Without `HOOD_API_URL`, the Robinhood Chain reads answer 503 and nothing is
+/// called.
+#[tokio::test]
+async fn robinhood_reads_answer_503_while_the_hood_api_is_not_configured() {
+    let api = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{"ok":true}"#, "application/json"))
+        .mount(&api)
+        .await;
+    let base = serve(&api.uri(), None, Duration::from_secs(5)).await;
+    let http = test_client();
+    for case in hood_cases() {
+        let response = http
+            .get(format!("{base}{}", case.path))
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            case.path
+        );
+        let body: Value = json(response).await;
+        assert_error_shape(&body, 503, "upstream");
+        assert_eq!(body["error"], "hood-api is not configured", "{}", case.path);
+    }
+    // A bad address is still a 400, not a 503.
+    let response = http
+        .get(format!("{base}/robinhood/tokens/pons"))
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        api.received_requests().await.expect("recording").is_empty(),
+        "the platform API must not stand in for the hood API"
+    );
+}
+
+/// The hood API answers errors as `{"error": ...}`; they come back as sent,
+/// with its `Cache-Control`, and a checksummed address reaches it unchanged.
+#[tokio::test]
+async fn hood_api_answers_pass_through_unchanged() {
+    let gateway = Gateway::start().await;
+    let not_found = r#"{"error":"no visible trades for that token"}"#;
+    Mock::given(wiremock::matchers::path(format!(
+        "/robinhood/tokens/{EVM_TOKEN}"
+    )))
+    .respond_with(ResponseTemplate::new(404).set_body_raw(not_found, "application/json"))
+    .mount(&gateway.hood)
+    .await;
+    let board = r#"{"rows":[],"as_of":{"latest":100765556}}"#;
+    Mock::given(wiremock::matchers::path("/robinhood/board"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(board, "application/json")
+                .insert_header("cache-control", "public, max-age=2")
+                .insert_header("access-control-allow-origin", "*"),
+        )
+        .mount(&gateway.hood)
+        .await;
+    let unavailable = r#"{"error":"wallet balances need the chain: ST_EVM_HTTP_URL is not set"}"#;
+    Mock::given(wiremock::matchers::path(format!(
+        "/robinhood/wallets/{EVM_WALLET}/balances"
+    )))
+    .respond_with(
+        ResponseTemplate::new(503)
+            .set_body_raw(unavailable, "application/json")
+            .insert_header("retry-after", "5"),
+    )
+    .mount(&gateway.hood)
+    .await;
+
+    let response = gateway
+        .send(Method::GET, &format!("/robinhood/tokens/{EVM_TOKEN}"))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.expect("body"), not_found);
+
+    let response = gateway.send(Method::GET, "/robinhood/board").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().expect("ASCII")),
+        Some("public, max-age=2")
+    );
+    assert!(response
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+    assert_eq!(response.text().await.expect("body"), board);
+
+    let response = gateway
+        .send(
+            Method::GET,
+            &format!("/robinhood/wallets/{EVM_WALLET}/balances"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().expect("ASCII")),
+        Some("5")
+    );
+    assert_eq!(response.text().await.expect("body"), unavailable);
+
+    assert!(
+        gateway.received().await.is_empty(),
+        "the platform API is not called"
+    );
+}
+
+/// A hood API that can't be reached answers 502 naming it.
+#[tokio::test]
+async fn an_unreachable_hood_api_answers_502_naming_it() {
+    let api = MockServer::start().await;
+    let base = serve(
+        &api.uri(),
+        Some(&closed_port_url().await),
+        Duration::from_secs(2),
+    )
+    .await;
+    let response = test_client()
+        .get(format!("{base}/robinhood/pulse"))
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = json(response).await;
+    assert_error_shape(&body, 502, "upstream");
+    assert_eq!(body["error"], "hood-api is unavailable");
+    assert!(api.received_requests().await.expect("recording").is_empty());
 }

@@ -111,6 +111,7 @@ Every route goes to the platform API on the same path.
 | POST | `/solana/submit` | platform (money route, 35s) | |
 | POST | `/solana/rpc` | platform | |
 | GET | `/solana/blockhash` | platform | |
+| GET | `/hood/trade/availability` | platform | |
 | POST | `/hood/wallets/register` | platform | |
 | POST | `/hood/trade/quote` | platform (money route, 35s) | |
 | POST | `/hood/trade/swap` | platform (money route, 65s) | |
@@ -288,9 +289,21 @@ forwards both of its HTTP surfaces:
   or the chain RPC is down. `/healthz` is not forwarded.
 - **Trading** (`/hood/...`) goes to the platform API (`st-api/src/hood/`, behind
   `require_auth` and the `hood_trading` user flag). The quote and the swap are money
-  routes. **These four routes are listed from the design (section 11) and not built
-  yet**: until st-api ships them, the platform answers `404`. Check their paths and
-  bodies against st-api when it does.
+  routes. **st-api does not serve these five routes yet**: they are built on the
+  solana-terminal `lane/trade-routes` branch, not yet merged into `robinhood`, and until
+  they ship the platform answers `404`. What they take, from that branch:
+  - `GET /hood/trade/availability?token=0x...`: whether the user can trade the token
+    now, with a typed `reason` when not, and the limits (`max_trade_wei`,
+    `max_slippage_bps`, `decimals`, `snipe_tax_bps`, `sell_enabled`).
+  - `POST /hood/trade/quote`: `{ token, side, amount_raw, slippage_bps }`. Writes nothing.
+  - `POST /hood/trade/swap`: the quote body plus `client_order_id`; answers `202` with
+    `order_id`. A repeated `client_order_id` with the same trade returns the same order,
+    so a retry after a timeout is safe.
+  - `GET /hood/trade/orders/{id}`: one of the user's orders (`404` for anyone else's).
+  - `POST /hood/wallets/register`: `{ wallet, active }`, the user's Privy EVM wallet.
+
+  Their errors are `{ "error": <code>, "message": ... }`, with codes such as `paused`,
+  `not_allowed`, `cap_exceeded`, `sell_unverified` and `wallet_busy`.
 
 `{token}` and `{wallet}` must be `0x` and 40 hex digits, in any case (the hood API
 lowercases them); anything else is a `400` and nothing is forwarded. While
@@ -298,8 +311,12 @@ lowercases them); anything else is a `400` and nothing is forwarded. While
 `503 {"error":"hood-api is not configured","code":503,"category":"upstream"}` and calls
 nothing.
 
-Live updates come from the hood API's WebSocket (`wss://<hood host>/v2/robinhood/ws`),
-which the app opens directly, like the other sockets.
+Live updates do not go through the gateway or the hood API. They come over the socket
+the app already opens directly, st-ws-server's `/ws` (`EXPO_PUBLIC_WS_URL`): the client
+sends `set_pulse_chains` with `["solana", "robinhood"]` to receive Robinhood board
+frames, and joins a token's room as `robinhood:0x...` (the chain-qualified key, never
+the bare address) for its trades. See `docs/architecture/st-ws.md` section 7a in
+solana-terminal.
 
 ### Route precedence
 

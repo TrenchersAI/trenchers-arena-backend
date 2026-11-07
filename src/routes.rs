@@ -294,8 +294,10 @@ pub static ROUTES: &[Route] = &[
     trade(Post, "/solana/submit", Duration::from_secs(35)),
     api(Post, "/solana/rpc"),
     api(Get, "/solana/blockhash"),
-    // Robinhood Chain trading (Hood v2, `st-api/src/hood/`). The platform
-    // answers 404 until it ships them. Timeouts as for the Solana swap.
+    // Robinhood Chain trading (Hood v2, `st-api/src/hood/`, on the
+    // solana-terminal `lane/trade-routes` branch). The platform answers 404
+    // until it ships them. Timeouts as for the Solana swap.
+    api(Get, "/hood/trade/availability"),
     api(Post, "/hood/wallets/register"),
     trade(Post, "/hood/trade/quote", Duration::from_secs(35)),
     trade(Post, "/hood/trade/swap", Duration::from_secs(65)),
@@ -639,10 +641,12 @@ mod tests {
     }
 
     /// The Hood v2 trading routes go to the platform API. The quote and the
-    /// swap move money; the wallet registration and the order read don't.
+    /// swap move money; the availability check, the wallet registration and
+    /// the order read don't.
     #[test]
     fn should_send_the_hood_trading_routes_to_the_platform_api() {
         for (verb, path, limit) in [
+            (Get, "/hood/trade/availability", Limit::Platform),
             (Post, "/hood/wallets/register", Limit::Platform),
             (Post, "/hood/trade/quote", Limit::Trade),
             (Post, "/hood/trade/swap", Limit::Trade),
@@ -944,6 +948,11 @@ mod tests {
                 let build = || router.clone();
                 let mut cases = vec![
                     (
+                        Method::GET,
+                        "/hood/trade/availability".to_owned(),
+                        "/hood/trade/availability",
+                    ),
+                    (
                         Method::POST,
                         "/hood/wallets/register".to_owned(),
                         "/hood/wallets/register",
@@ -1040,6 +1049,8 @@ mod tests {
                     (Method::POST, "/hood/trade/orders".to_owned()),
                     (Method::DELETE, format!("/hood/trade/orders/{order}")),
                     (Method::GET, "/hood/wallets/register".to_owned()),
+                    (Method::POST, "/hood/trade/availability".to_owned()),
+                    (Method::GET, "/hood/trade".to_owned()),
                 ] {
                     assert_ne!(
                         method_matched(build(), method.clone(), &uri).await.0,

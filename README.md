@@ -10,9 +10,10 @@ Arena app
    v
 trenchers-arena-backend  (this repo)
    |
-   |-- auth, bots, arena, trading --> platform API  (PLATFORM_API_URL)
+   |-- auth, bots, arena, trading,
+   |   Robinhood Chain trading (/hood/*) --> platform API  (PLATFORM_API_URL)
    '-- Robinhood Chain market data
-       (/robinhood/*)             --> hood API      (HOOD_API_URL, optional)
+       (/robinhood/*)                    --> hood API      (HOOD_API_URL, optional)
 ```
 
 Solana market data (charts, the pulse feed) and all WebSockets do not go through the
@@ -110,6 +111,11 @@ Every route goes to the platform API on the same path.
 | POST | `/solana/submit` | platform (money route, 35s) | |
 | POST | `/solana/rpc` | platform | |
 | GET | `/solana/blockhash` | platform | |
+| GET | `/hood/trade/availability` | platform | |
+| POST | `/hood/wallets/register` | platform | |
+| POST | `/hood/trade/quote` | platform (money route, 35s) | |
+| POST | `/hood/trade/swap` | platform (money route, 65s) | |
+| GET | `/hood/trade/orders/{id}` | platform | `id`: UUID |
 | GET | `/robinhood/board` | hood | |
 | GET | `/robinhood/pulse` | hood | |
 | GET | `/robinhood/search` | hood | |
@@ -167,8 +173,8 @@ in `src/routes.rs`. Each one gets:
 
 | Route | Gateway timeout | App timeout |
 |-------|-----------------|-------------|
-| `POST /trade/swap`, `POST /orders` | 65s | 60s |
-| `DELETE /orders/{id}`, `POST /trade/swap/prepare`, `/trade/swap/complete`, `/trade/sell-init/quote`, `POST /solana/submit` | 35s | 30s |
+| `POST /trade/swap`, `POST /orders`, `POST /hood/trade/swap` | 65s | 60s |
+| `DELETE /orders/{id}`, `POST /trade/swap/prepare`, `/trade/swap/complete`, `/trade/sell-init/quote`, `POST /solana/submit`, `POST /hood/trade/quote` | 35s | 30s |
 | `POST /bots/{id}/wallet/fund`, `/bots/{id}/wallet/withdraw` | 20s | 15s (the app's default) |
 
 `/trade/sell-init/quote` moves no money (the platform treats it as a read) but sits in
@@ -270,7 +276,7 @@ The source for these facts is the platform API (`solana-terminal`, `crates/st-ap
 
 Hood v2 (Robinhood Chain, chain 4663) is built on the `robinhood` branch of
 solana-terminal; its design is `docs/architecture/hood-v2.md` there. The gateway
-forwards its market data:
+forwards both of its HTTP surfaces:
 
 - **Market data** (`/robinhood/...`) goes to the hood API, `st-indexerd-evm`'s read
   role (the `evm-api` deployment), on the same path. These are the paths the web app
@@ -281,6 +287,23 @@ forwards its market data:
   come back as it sent them, `{ "error": "..." }`: a `404` for an unknown token or a
   chain it does not index, a `400` for a bad query value, `502`/`503` when ClickHouse
   or the chain RPC is down. `/healthz` is not forwarded.
+- **Trading** (`/hood/...`) goes to the platform API (`st-api/src/hood/`, behind
+  `require_auth` and the `hood_trading` user flag). The quote and the swap are money
+  routes. **st-api does not serve these five routes yet**: they are built on the
+  solana-terminal `lane/trade-routes` branch, not yet merged into `robinhood`, and until
+  they ship the platform answers `404`. What they take, from that branch:
+  - `GET /hood/trade/availability?token=0x...`: whether the user can trade the token
+    now, with a typed `reason` when not, and the limits (`max_trade_wei`,
+    `max_slippage_bps`, `decimals`, `snipe_tax_bps`, `sell_enabled`).
+  - `POST /hood/trade/quote`: `{ token, side, amount_raw, slippage_bps }`. Writes nothing.
+  - `POST /hood/trade/swap`: the quote body plus `client_order_id`; answers `202` with
+    `order_id`. A repeated `client_order_id` with the same trade returns the same order,
+    so a retry after a timeout is safe.
+  - `GET /hood/trade/orders/{id}`: one of the user's orders (`404` for anyone else's).
+  - `POST /hood/wallets/register`: `{ wallet, active }`, the user's Privy EVM wallet.
+
+  Their errors are `{ "error": <code>, "message": ... }`, with codes such as `paused`,
+  `not_allowed`, `cap_exceeded`, `sell_unverified` and `wallet_busy`.
 
 `{token}` and `{wallet}` must be `0x` and 40 hex digits, in any case (the hood API
 lowercases them); anything else is a `400` and nothing is forwarded. While

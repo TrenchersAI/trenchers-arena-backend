@@ -294,6 +294,14 @@ pub static ROUTES: &[Route] = &[
     trade(Post, "/solana/submit", Duration::from_secs(35)),
     api(Post, "/solana/rpc"),
     api(Get, "/solana/blockhash"),
+    // Robinhood Chain trading (Hood v2, `st-api/src/hood/`, on the
+    // solana-terminal `lane/trade-routes` branch). The platform answers 404
+    // until it ships them. Timeouts as for the Solana swap.
+    api(Get, "/hood/trade/availability"),
+    api(Post, "/hood/wallets/register"),
+    trade(Post, "/hood/trade/quote", Duration::from_secs(35)),
+    trade(Post, "/hood/trade/swap", Duration::from_secs(65)),
+    api(Get, "/hood/trade/orders/{id}"),
     // Robinhood Chain market data, from the hood API (`st-indexerd-evm`).
     // `{token}` and `{wallet}` are 0x EVM addresses. Live updates come from
     // its WebSocket, which the app opens directly.
@@ -457,6 +465,8 @@ mod tests {
         (Post, "/trade/sell-init/quote", 35),
         (Post, "/orders", 65),
         (Post, "/solana/submit", 35),
+        (Post, "/hood/trade/quote", 35),
+        (Post, "/hood/trade/swap", 65),
     ];
 
     #[test]
@@ -628,6 +638,27 @@ mod tests {
             }
         }
         assert_eq!(hood, 16, "every hood API read except /healthz");
+    }
+
+    /// The Hood v2 trading routes go to the platform API. The quote and the
+    /// swap move money; the availability check, the wallet registration and
+    /// the order read don't.
+    #[test]
+    fn should_send_the_hood_trading_routes_to_the_platform_api() {
+        for (verb, path, limit) in [
+            (Get, "/hood/trade/availability", Limit::Platform),
+            (Post, "/hood/wallets/register", Limit::Platform),
+            (Post, "/hood/trade/quote", Limit::Trade),
+            (Post, "/hood/trade/swap", Limit::Trade),
+            (Get, "/hood/trade/orders/{id}", Limit::Platform),
+        ] {
+            let route = ROUTES
+                .iter()
+                .find(|route| route.verb == verb && route.path == path)
+                .unwrap_or_else(|| panic!("{path} is listed"));
+            assert_eq!(route.upstream, Upstream::Platform, "{path}");
+            assert_eq!(route.limit(), limit, "{path}");
+        }
     }
 
     #[test]
@@ -904,16 +935,43 @@ mod tests {
 
         /// The Robinhood Chain paths each reach their own pattern in either
         /// order: `/robinhood/tokens/{token}` and its trades are distinct, the
-        /// terminal family never swallows a longer path.
+        /// terminal family never swallows a longer path, and the trading
+        /// routes don't overlap the Solana ones.
         #[tokio::test]
         async fn robinhood_paths_reach_their_own_route() {
             let token = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984";
+            let order = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
             for (label, router) in [
                 ("table order", echo_router(ROUTES.iter())),
                 ("reverse order", echo_router(ROUTES.iter().rev())),
             ] {
                 let build = || router.clone();
                 let mut cases = vec![
+                    (
+                        Method::GET,
+                        "/hood/trade/availability".to_owned(),
+                        "/hood/trade/availability",
+                    ),
+                    (
+                        Method::POST,
+                        "/hood/wallets/register".to_owned(),
+                        "/hood/wallets/register",
+                    ),
+                    (
+                        Method::POST,
+                        "/hood/trade/quote".to_owned(),
+                        "/hood/trade/quote",
+                    ),
+                    (
+                        Method::POST,
+                        "/hood/trade/swap".to_owned(),
+                        "/hood/trade/swap",
+                    ),
+                    (
+                        Method::GET,
+                        format!("/hood/trade/orders/{order}"),
+                        "/hood/trade/orders/{id}",
+                    ),
                     (
                         Method::GET,
                         "/robinhood/board".to_owned(),
@@ -987,6 +1045,12 @@ mod tests {
                     ),
                     (Method::GET, format!("/robinhood/tokens/{token}/holders")),
                     (Method::GET, format!("/robinhood/wallets/{token}")),
+                    (Method::GET, "/hood/trade/quote".to_owned()),
+                    (Method::POST, "/hood/trade/orders".to_owned()),
+                    (Method::DELETE, format!("/hood/trade/orders/{order}")),
+                    (Method::GET, "/hood/wallets/register".to_owned()),
+                    (Method::POST, "/hood/trade/availability".to_owned()),
+                    (Method::GET, "/hood/trade".to_owned()),
                 ] {
                     assert_ne!(
                         method_matched(build(), method.clone(), &uri).await.0,

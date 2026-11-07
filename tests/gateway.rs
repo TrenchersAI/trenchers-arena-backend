@@ -26,6 +26,7 @@ const FUNDING: &str = "0f8d2c4e-6a1b-4c3d-9e5f-7a8b9c0d1e2f";
 /// A Robinhood Chain token and wallet, as the app sends them (checksummed).
 const EVM_TOKEN: &str = "0x1F9840a85d5aF5bf1D1762F925BDADdC4201F984";
 const EVM_WALLET: &str = "0x9a3B5c7D1e2F4a6b8C0d2E4f6A8b0C2d4E6f8A0b";
+const HOOD_ORDER: &str = "6d2f8a1c-3b4e-4c5d-8e9f-0a1b2c3d4e5f";
 const USER_AGENT: &str = concat!("trenchers-arena-backend/", env!("CARGO_PKG_VERSION"));
 
 const PRIVY_BODY: &str = r#"{"privy_token":"privy.token.value","wallet_address":"9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"}"#;
@@ -47,6 +48,11 @@ const SELL_INIT_QUOTE_BODY: &str =
 const ORDER_BODY: &str = r#"{"order_type":"limit","side":"buy","token_mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":"100000000","slippage_bps":500,"trigger_price":"0.000042"}"#;
 const SUBMIT_BODY: &str = r#"{"transaction":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}"#;
 const RPC_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[["5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW"],{"searchTransactionHistory":true}]}"#;
+// The Hood trade bodies as st-api's `hood` module reads them.
+const HOOD_REGISTER_BODY: &str =
+    r#"{"wallet":"0x9a3b5c7d1e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b","active":true}"#;
+const HOOD_QUOTE_BODY: &str = r#"{"token":"0x1f9840a85d5af5bf1d1762f925bdaddc4201f984","side":"buy","amount_raw":"10000000000000000","slippage_bps":500}"#;
+const HOOD_SWAP_BODY: &str = r#"{"client_order_id":"hood-7f3a","token":"0x1f9840a85d5af5bf1d1762f925bdaddc4201f984","side":"buy","amount_raw":"10000000000000000","slippage_bps":500}"#;
 const CLONE_KEY: &str = "clone-6a1f9c2e-entrant-5b0e8f0e";
 const CLONE_BODY: &str =
     r#"{"name":"My Opus copy","idempotency_key":"clone-6a1f9c2e-entrant-5b0e8f0e"}"#;
@@ -665,6 +671,37 @@ fn contract() -> Vec<Case> {
             M::GET,
             "/solana/blockhash",
             "/solana/blockhash".into(),
+            None,
+        ),
+        // Robinhood Chain trading (platform API)
+        api(
+            M::GET,
+            "/hood/trade/availability",
+            format!("/hood/trade/availability?token={EVM_TOKEN}"),
+            None,
+        ),
+        api(
+            M::POST,
+            "/hood/wallets/register",
+            "/hood/wallets/register".into(),
+            Some(HOOD_REGISTER_BODY),
+        ),
+        api(
+            M::POST,
+            "/hood/trade/quote",
+            "/hood/trade/quote".into(),
+            Some(HOOD_QUOTE_BODY),
+        ),
+        api(
+            M::POST,
+            "/hood/trade/swap",
+            "/hood/trade/swap".into(),
+            Some(HOOD_SWAP_BODY),
+        ),
+        api(
+            M::GET,
+            "/hood/trade/orders/{id}",
+            format!("/hood/trade/orders/{HOOD_ORDER}"),
             None,
         ),
     ]
@@ -1554,6 +1591,13 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
             format!("/robinhood/tokens/{EVM_TOKEN}/holders"),
         ),
         (Method::GET, format!("/robinhood/wallets/{EVM_WALLET}")),
+        (Method::GET, "/hood/trade/quote".into()),
+        (Method::GET, "/hood/trade/swap".into()),
+        (Method::GET, "/hood/trade/orders".into()),
+        (Method::DELETE, format!("/hood/trade/orders/{HOOD_ORDER}")),
+        (Method::GET, "/hood/wallets/register".into()),
+        (Method::POST, "/hood/trade/availability".into()),
+        (Method::POST, "/hood/wallets/withdraw".into()),
     ];
     for (method, path) in &cases {
         let response = gateway.send(method.clone(), path).await;
@@ -1695,6 +1739,8 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
             "/robinhood/terminal/0xZZ9840a85d5aF5bf1D1762F925BDADdC4201F984/holders".into(),
         ),
         (Method::GET, format!("/robinhood/wallets/{WALLET}/balances")),
+        (Method::GET, "/hood/trade/orders/not-a-uuid".into()),
+        (Method::GET, format!("/hood/trade/orders/{EVM_TOKEN}")),
     ];
     for (method, path) in &cases {
         let response = gateway.send(method.clone(), path).await;
@@ -1729,6 +1775,7 @@ async fn malformed_path_parameters_answer_400_without_reaching_any_upstream() {
         "/robinhood/tokens/%2e%2e/trades".to_owned(),
         format!("/robinhood/terminal/{EVM_TOKEN}%2F..%2F..%2Fhealthz/status"),
         "/robinhood/wallets/..%2F..%2Fhealthz/balances".to_owned(),
+        "/hood/trade/orders/%2e%2e".to_owned(),
     ];
     for target in &raw_targets {
         let (status, body) = raw_request(&gateway.base, &raw_get(target), b"").await;
@@ -2197,7 +2244,7 @@ async fn a_missing_bot_wallet_404_passes_through_unchanged() {
 // ---------------------------------------------------------------------------
 
 /// Without `HOOD_API_URL`, the Robinhood Chain reads answer 503 and nothing is
-/// called.
+/// called. The hood trading routes still go to the platform API.
 #[tokio::test]
 async fn robinhood_reads_answer_503_while_the_hood_api_is_not_configured() {
     let api = MockServer::start().await;
@@ -2234,6 +2281,16 @@ async fn robinhood_reads_answer_503_while_the_hood_api_is_not_configured() {
         api.received_requests().await.expect("recording").is_empty(),
         "the platform API must not stand in for the hood API"
     );
+
+    let response = http
+        .post(format!("{base}/hood/trade/quote"))
+        .header("authorization", "Bearer session.jwt")
+        .header("content-type", "application/json")
+        .body(HOOD_QUOTE_BODY)
+        .send()
+        .await
+        .expect("the gateway answers");
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 /// The hood API answers errors as `{"error": ...}`; they come back as sent,

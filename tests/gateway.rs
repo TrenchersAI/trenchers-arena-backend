@@ -1595,6 +1595,7 @@ async fn unlisted_routes_answer_404_without_reaching_any_upstream() {
         (Method::GET, "/hood/trade/orders".into()),
         (Method::DELETE, format!("/hood/trade/orders/{HOOD_ORDER}")),
         (Method::GET, "/hood/wallets/register".into()),
+        (Method::POST, "/hood/trade/availability".into()),
         (Method::POST, "/hood/wallets/withdraw".into()),
     ];
     for (method, path) in &cases {
